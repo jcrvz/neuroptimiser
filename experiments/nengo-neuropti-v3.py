@@ -14,7 +14,7 @@ from ioh import get_problem
 
 #%%
 
-PROBLEM_ID      = 3  # Problem ID from the IOH framework
+PROBLEM_ID      = 12  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
 NEURONS_PER_DIM = 100
@@ -34,11 +34,16 @@ X_UPPER_BOUND0  = X_UPPER_BOUND.copy()
 
 # Exploitation (search-space shrinking) schedule
 SEED_VALUE      = 69
-SHRINK_EVERY    = 1.0     # seconds between shrink operations
+DEFAULT_WAIT    = 1.0     # seconds between shrink operations
 
 # Action space: proportion of current range to keep after a shrink
-ACTIONS         = [-1.0, 0.25, 0.5, 0.75, 1.0]  # -1.0 = RESET to global bounds
-q_eps_init      = 0.2
+MODES_IDX       = {"Global": 0, "Local": 1}
+ACTIONS         = [-1.0, 0.2, 0.5, 1.0]  # -1.0 = RESET to global bounds
+ALLOWED_ACTIONS = {
+    "Global": [i for i, a in enumerate(ACTIONS) if a > 0.0],  # only shrink and hold
+    "Local":  np.arange(len(ACTIONS)).tolist(),
+}
+q_eps_init      = 0.3
 q_eps_min       = 0.01
 q_eps_decay     = 0.05
 q_alpha         = 0.1
@@ -53,7 +58,7 @@ ACTION_DELAY    = 0.01  # seconds to retarget the EA to the best_v after a shrin
 
 # Create the Nengo model
 model = nengo.Network(label="nNeurOpti V1", seed=69)
-with (model):
+with model:
     # INITIALISATION
     # --------------------------------------------------------------
     v0_state    = tro2s(X_INITIAL_GUESS, X_LOWER_BOUND, X_UPPER_BOUND)
@@ -73,10 +78,18 @@ with (model):
         "last_adjust": 0.0,
         "retarget_until": 0.0,   # time until which we inject best_v after a shrink
         "last_action_id": ACTIONS.index(1.0),  # start with no shrink
+        "last_best_f": None,
         "reward": 0.0, # last reward obtained
+        "mode": "Global",  # start in Global mode
+        "wait_time": DEFAULT_WAIT,
+        "last_reset_time": -1e9,
+        "reset_cooldown": 5.0,  # seconds between resets
+        "eps_lock_until": 0.0,  # time until which we keep epsilon at initial value
     }
 
-    q_table = np.zeros((len(ACTIONS),))
+    # Q-learning table with warm start
+    q_table         = np.zeros((len(MODES_IDX), len(ACTIONS)))
+    # q_table[0, 0]   = 0.0 # There is no reset in Global mode
 
     # Evaluate the objective function
     def f_obj(t, state_vector):
@@ -88,7 +101,7 @@ with (model):
         return np.concatenate((v, [fv]))
 
     state["best_f"]         = f_obj(None, v0_state)[-1]
-    # state["last_best_f"]    = state["best_f"]
+    state["last_best_f"]    = state["best_f"]
     state["best_x"]         = trs2o(state["best_v"], state["lb"], state["ub"])
 
     # DEFINE THE MAIN COMPONENTS
@@ -102,7 +115,7 @@ with (model):
         ens_dimensions  = 1,
         radius          = 1.0,
         intercepts  = nengo.dists.Uniform(-0.9, 0.9),
-        max_rates   = nengo.dists.Uniform(80,220),
+        # max_rates   = nengo.dists.Uniform(80,220),
         encoders    = nengo.dists.UniformHypersphere(surface=True),
         neuron_type     = nengo.LIF(),
         seed            = SEED_VALUE,
@@ -142,39 +155,60 @@ with (model):
 
     # Scheduler function to trigger shrink operations
     def neuromodulator(t, best_f):
-        _reward                 = 1.0 if best_f.item() < state["best_f"] else -1.0
+        _reward                 = 1.0 if best_f.item() < state["last_best_f"] else -1.0
+        _reward                 += 1.0 if best_f.item() < state["best_f"] else 0.0
+        state["last_best_f"]    = best_f.item()
         state["reward"]         += _reward
 
-        # Trigger every SHRINK_EVERY seconds after a short warmup
-        if (state["best_v"] is None) or (t < 0.1) or (t - state["last_adjust"] < SHRINK_EVERY):
+        # Trigger every wait_time seconds after a short warmup
+        if (state["best_v"] is None) or (t < 0.1) or \
+            (t - state["last_adjust"] < state["wait_time"]):
             return state["width_proportion"]
 
         # Q-learning update using the last reward obtained
-        last_reward         = state["reward"]
+        last_mode           = state["mode"]
+        last_mode_idx       = MODES_IDX[last_mode]
         last_action_idx     = int(state["last_action_id"])
-        q_value             = q_table[last_action_idx]
-        q_value             += q_alpha * (last_reward + q_gamma * q_table.max() - q_value)
-        q_table[last_action_idx] = q_value
+        last_reward         = state["reward"]
+
+        # Bellman update for Q-value of last state-action pair
+        q_table[last_mode_idx, last_action_idx] += \
+            q_alpha * (last_reward + q_gamma * np.max(q_table[last_mode_idx, :]) - q_table[last_mode_idx, last_action_idx])
 
         # Choose action based on epsilon-greedy policy
-        q_eps_t = max(q_eps_min, q_eps_init * np.exp(-q_eps_decay * t))
+        allowed_actions     = list(ALLOWED_ACTIONS[state["mode"]])
+
+        if (t - state["last_reset_time"] < state["reset_cooldown"]) \
+            and (0 in allowed_actions):
+            allowed_actions.remove(0)  # Remove RESET action if in cooldown
+        # epsilon with optional temporary lock
+        q_eps_t             = max(
+            q_eps_min, q_eps_init * np.exp(-q_eps_decay * t))
+        if t < state["eps_lock_until"]:
+            q_eps_t = min(q_eps_t, 0.05)
         if np.random.rand() < q_eps_t:
-            action_idx = np.random.randint(len(ACTIONS))
+            action_idx  = np.random.choice(allowed_actions)
         else:
-            max_q       = np.max(q_table)
-            best_idxs   = np.flatnonzero(q_table == max_q)
-            action_idx  = np.random.choice(best_idxs)
+            q_marginal  = q_table[last_mode_idx, allowed_actions]
+            best_idxs   = np.flatnonzero(q_marginal == q_marginal.max())
+            action_idx  = allowed_actions[np.random.choice(best_idxs)]
+
         proportion = ACTIONS[action_idx]
 
         # Apply the action: shrink / expand the search space, or RESET to global bounds
-        if proportion == -1.0:
+        if proportion == -1.0: # RESET action only if in Local mode
             # RESET: restore original global bounds and width proportion
             new_lb = X_LOWER_BOUND0.copy()
             new_ub = X_UPPER_BOUND0.copy()
             state["width_proportion"] = 1.0
 
             # Recompute best_v under the RESET bounds
-            new_best_v = tro2s(state["best_x"], new_lb, new_ub)
+            new_best_v          = tro2s(state["best_x"], new_lb, new_ub)
+            state["wait_time"]  = 1 * DEFAULT_WAIT
+            next_mode           = "Global"
+
+            state["last_reset_time"] = t
+            state["eps_lock_until"] = t + 1.0 * state["wait_time"]
 
         else:
             # Current widths and target widths after shrinking
@@ -193,22 +227,23 @@ with (model):
             new_ub      = np.maximum(new_ub, new_lb + EPS)
 
             # Recompute best_v under the NEW bounds so it stays centred on the same best_x
-            if state["best_x"] is not None:
-                new_best_v = tro2s(state["best_x"], new_lb, new_ub)
-            else:
-                new_best_v = state["best_v"]
+            new_best_v  = tro2s(state["best_x"], new_lb, new_ub) \
+                if state["best_x"] is not None else state["best_v"]
 
             state["width_proportion"]   *= proportion
+            next_mode                   = "Local"
+            state["wait_time"]          = 1 * DEFAULT_WAIT
 
         # Update the local state
-        state["lb"], state["ub"]= new_lb, new_ub
-        state["best_v"]         = np.clip(new_best_v, -1.0, 1.0)
-        state["retarget_until"] = t + ACTION_DELAY
-        state["last_adjust"]    = t
+        state["lb"], state["ub"]    = new_lb, new_ub
+        state["best_v"]             = np.clip(new_best_v, -1.0, 1.0)
+        state["retarget_until"]     = t + ACTION_DELAY
+        state["last_adjust"]        = t
 
         # Update last best f and reward
         state["last_action_id"]     = action_idx
-        state["cum_diff"]           = 0.0
+        state["mode"]               = next_mode
+        state["reward"]             = 0.0
 
         return state["width_proportion"]
 
