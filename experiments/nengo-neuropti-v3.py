@@ -1,16 +1,13 @@
 #%%
 import matplotlib.pyplot as plt
+import nengo
 # from collections import deque
 import numpy as np
-
-import nengo
-from nengo.utils.ensemble import sorted_neurons
+from ioh import get_problem
 from nengo.utils.matplotlib import rasterplot
 
 # Transformations
 from neuroptimiser.utils import tro2s, trs2o
-
-from ioh import get_problem
 
 #%%
 
@@ -35,20 +32,7 @@ X_UPPER_BOUND0  = X_UPPER_BOUND.copy()
 # Exploitation (search-space shrinking) schedule
 SEED_VALUE      = 69
 DEFAULT_WAIT    = 1.0     # seconds between shrink operations
-
-# Action space: proportion of current range to keep after a shrink
-MODES_IDX       = {"Global": 0, "Local": 1}
-ACTIONS         = [-1.0, 0.2, 0.5, 1.0]  # -1.0 = RESET to global bounds
-ALLOWED_ACTIONS = {
-    "Global": [i for i, a in enumerate(ACTIONS) if a > 0.0],  # only shrink and hold
-    "Local":  np.arange(len(ACTIONS)).tolist(),
-}
-q_eps_init      = 0.3
-q_eps_min       = 0.01
-q_eps_decay     = 0.05
-q_alpha         = 0.1
-q_gamma         = 0.95
-
+STAG_RESET      = 3.0     # seconds of stagnation before a RESET to global bounds
 EPS             = 1e-12   # small value to ensure numerical ordering of bounds
 MIN_WIDTH       = 1e-12   # do not shrink any dimension below this absolute width
 ACTION_DELAY    = 0.01  # seconds to retarget the EA to the best_v after a shrink
@@ -77,19 +61,12 @@ with model:
         "width_proportion": 1.0,
         "last_adjust": 0.0,
         "retarget_until": 0.0,   # time until which we inject best_v after a shrink
-        "last_action_id": ACTIONS.index(1.0),  # start with no shrink
         "last_best_f": None,
-        "reward": 0.0, # last reward obtained
-        "mode": "Global",  # start in Global mode
         "wait_time": DEFAULT_WAIT,
         "last_reset_time": -1e9,
-        "reset_cooldown": 5.0,  # seconds between resets
-        "eps_lock_until": 0.0,  # time until which we keep epsilon at initial value
+        "reset_cooldown": 3.0,  # seconds between resets
+        "t_stag_start": 0.0,
     }
-
-    # Q-learning table with warm start
-    q_table         = np.zeros((len(MODES_IDX), len(ACTIONS)))
-    # q_table[0, 0]   = 0.0 # There is no reset in Global mode
 
     # Evaluate the objective function
     def f_obj(t, state_vector):
@@ -155,45 +132,28 @@ with model:
 
     # Scheduler function to trigger shrink operations
     def neuromodulator(t, best_f):
-        _reward                 = 1.0 if best_f.item() < state["last_best_f"] else -1.0
-        _reward                 += 1.0 if best_f.item() < state["best_f"] else 0.0
-        state["last_best_f"]    = best_f.item()
-        state["reward"]         += _reward
+        if best_f.item() < state["last_best_f"]:
+            state["t_stag_start"] = t
+            state["last_best_f"] = best_f.item()
+
+        stagnated   = (t - state["t_stag_start"]) >= STAG_RESET
+        can_reset   = (t - state["last_reset_time"]) >= state["reset_cooldown"]
 
         # Trigger every wait_time seconds after a short warmup
-        if (state["best_v"] is None) or (t < 0.1) or \
-            (t - state["last_adjust"] < state["wait_time"]):
+        if (state["best_v"] is None) or (t < 0.1) or (
+                (t - state["last_adjust"] < state["wait_time"])):
             return state["width_proportion"]
 
-        # Q-learning update using the last reward obtained
-        last_mode           = state["mode"]
-        last_mode_idx       = MODES_IDX[last_mode]
-        last_action_idx     = int(state["last_action_id"])
-        last_reward         = state["reward"]
-
-        # Bellman update for Q-value of last state-action pair
-        q_table[last_mode_idx, last_action_idx] += \
-            q_alpha * (last_reward + q_gamma * np.max(q_table[last_mode_idx, :]) - q_table[last_mode_idx, last_action_idx])
-
-        # Choose action based on epsilon-greedy policy
-        allowed_actions     = list(ALLOWED_ACTIONS[state["mode"]])
-
-        if (t - state["last_reset_time"] < state["reset_cooldown"]) \
-            and (0 in allowed_actions):
-            allowed_actions.remove(0)  # Remove RESET action if in cooldown
-        # epsilon with optional temporary lock
-        q_eps_t             = max(
-            q_eps_min, q_eps_init * np.exp(-q_eps_decay * t))
-        if t < state["eps_lock_until"]:
-            q_eps_t = min(q_eps_t, 0.05)
-        if np.random.rand() < q_eps_t:
-            action_idx  = np.random.choice(allowed_actions)
+        # Decide on the action based on improvement and mode
+        if stagnated and can_reset and state["width_proportion"] <= 0.05:
+            proportion                  = -1.0  # RESET to global bounds if stagnated
+        elif stagnated:
+            proportion = 1.0  # Hold while waiting for cooldown
         else:
-            q_marginal  = q_table[last_mode_idx, allowed_actions]
-            best_idxs   = np.flatnonzero(q_marginal == q_marginal.max())
-            action_idx  = allowed_actions[np.random.choice(best_idxs)]
+            proportion = 0.5 # Shrink otherwise
 
-        proportion = ACTIONS[action_idx]
+        if np.any(state["ub"] - state["lb"] <= MIN_WIDTH):
+            proportion = -1.0  # RESET if any dimension is too small
 
         # Apply the action: shrink / expand the search space, or RESET to global bounds
         if proportion == -1.0: # RESET action only if in Local mode
@@ -203,12 +163,14 @@ with model:
             state["width_proportion"] = 1.0
 
             # Recompute best_v under the RESET bounds
-            new_best_v          = tro2s(state["best_x"], new_lb, new_ub)
-            state["wait_time"]  = 1 * DEFAULT_WAIT
-            next_mode           = "Global"
+            if state["best_x"] is not None:
+                new_best_v          = tro2s(state["best_x"], new_lb, new_ub)
+            else:
+                new_best_v = tro2s(X_INITIAL_GUESS, new_lb, new_ub)
 
-            state["last_reset_time"] = t
-            state["eps_lock_until"] = t + 1.0 * state["wait_time"]
+            state["best_x"]             = trs2o(new_best_v, new_lb, new_ub)
+            state["last_reset_time"]    = t
+            state["last_adjust"]        = t - state["wait_time"]
 
         else:
             # Current widths and target widths after shrinking
@@ -231,19 +193,15 @@ with model:
                 if state["best_x"] is not None else state["best_v"]
 
             state["width_proportion"]   *= proportion
-            next_mode                   = "Local"
-            state["wait_time"]          = 1 * DEFAULT_WAIT
+            state["last_adjust"]        = t
+            state["t_stag_start"]       = t
 
         # Update the local state
         state["lb"], state["ub"]    = new_lb, new_ub
         state["best_v"]             = np.clip(new_best_v, -1.0, 1.0)
         state["retarget_until"]     = t + ACTION_DELAY
-        state["last_adjust"]        = t
 
-        # Update last best f and reward
-        state["last_action_id"]     = action_idx
-        state["mode"]               = next_mode
-        state["reward"]             = 0.0
+        # print(t, state["lb"], state["ub"], state["width_proportion"], flush=True)
 
         return state["width_proportion"]
 
@@ -259,11 +217,19 @@ with model:
     def local_selector(t, x):
         v       = x[:NUM_DIMENSIONS]
         fv      = float(x[NUM_DIMENSIONS])
+
         if state["best_f"] is None or (fv < state["best_f"] and t >= 0.01):
+            # Register the previous best
+            # state["last_best_f"] = state["best_f"]
+
+            # Update the best-so-far
             state["best_f"] = fv
             state["best_v"] = v.copy()
             # store best in ORIGINAL space under current dynamic bounds
             state["best_x"] = trs2o(state["best_v"], state["lb"], state["ub"])
+
+            # Reset stagnation counter
+            # state["t_stag_start"] = t
 
         if state["best_v"] is None:
             return np.concatenate((v, [fv]))
