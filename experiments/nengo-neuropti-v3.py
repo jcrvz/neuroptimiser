@@ -15,7 +15,7 @@ PROBLEM_ID      = 12  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
 NEURONS_PER_DIM = 100
-SIMULATION_TIME = 50.0  # seconds
+SIMULATION_TIME = 100.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMENSIONS)
 problem.reset()
@@ -32,7 +32,7 @@ X_UPPER_BOUND0  = X_UPPER_BOUND.copy()
 # Exploitation (search-space shrinking) schedule
 SEED_VALUE      = 69
 DEFAULT_WAIT    = 1.0     # seconds between shrink operations
-STAG_RESET      = 3.0     # seconds of stagnation before a RESET to global bounds
+STAG_RESET      = 1.1     # seconds of stagnation before a RESET to global bounds
 EPS             = 1e-12   # small value to ensure numerical ordering of bounds
 MIN_WIDTH       = 1e-12   # do not shrink any dimension below this absolute width
 ACTION_DELAY    = 0.01  # seconds to retarget the EA to the best_v after a shrink
@@ -92,7 +92,7 @@ with model:
         ens_dimensions  = 1,
         radius          = 1.0,
         intercepts  = nengo.dists.Uniform(-0.9, 0.9),
-        # max_rates   = nengo.dists.Uniform(80,220),
+        max_rates   = nengo.dists.Uniform(100,220),
         encoders    = nengo.dists.UniformHypersphere(surface=True),
         neuron_type     = nengo.LIF(),
         seed            = SEED_VALUE,
@@ -145,15 +145,15 @@ with model:
             return state["width_proportion"]
 
         # Decide on the action based on improvement and mode
-        if stagnated and can_reset and state["width_proportion"] <= 0.05:
+        if stagnated and can_reset and state["width_proportion"] <= 0.1:
             proportion                  = -1.0  # RESET to global bounds if stagnated
         elif stagnated:
             proportion = 1.0  # Hold while waiting for cooldown
         else:
-            proportion = 0.5 # Shrink otherwise
+            proportion = 0.8 # Shrink otherwise
 
-        if np.any(state["ub"] - state["lb"] <= MIN_WIDTH):
-            proportion = -1.0  # RESET if any dimension is too small
+        # if np.any(state["ub"] - state["lb"] <= MIN_WIDTH):
+        #     proportion = -1.0  # RESET if any dimension is too small
 
         # Apply the action: shrink / expand the search space, or RESET to global bounds
         if proportion == -1.0: # RESET action only if in Local mode
