@@ -15,6 +15,7 @@ PROBLEM_ID      = 12  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
 NEURONS_PER_DIM = 100
+NEURONS_PER_ENS = 50
 SIMULATION_TIME = 50.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMENSIONS)
@@ -28,6 +29,10 @@ X_INITIAL_GUESS = np.random.uniform(X_LOWER_BOUND, X_UPPER_BOUND, NUM_DIMENSIONS
 # Keep copies of the original global bounds
 X_LOWER_BOUND0  = X_LOWER_BOUND.copy()
 X_UPPER_BOUND0  = X_UPPER_BOUND.copy()
+
+# List of actions
+ACTIONS         = ["SHRINK", "HOLD", "RESET"]
+NUM_ACTIONS     = len(ACTIONS)
 
 # Exploitation (search-space shrinking) schedule
 SEED_VALUE      = 69
@@ -86,7 +91,7 @@ with model:
 
     # [Main] Ensemble to represent the current state vector
     ea          = nengo.networks.EnsembleArray(
-        label           = "ens_array",
+        label           = "Motor EA",
         n_neurons       = NEURONS_PER_DIM,
         n_ensembles     = NUM_DIMENSIONS,
         ens_dimensions  = 1,
@@ -114,21 +119,38 @@ with model:
     )
 
     # Selector / controller node to move towards the best-so-far
-    eta = 0.6  # "Learning rate"
-    phi = 2.45
-    def hs(t, x):
-        if state["best_v"] is None:
-            return np.zeros_like(x)
-        # best_v = state["best_v"]
-        # return x + eta * (state["best_v"] - x) + np.random.normal(0, 0.1, size=x.shape)
-        # return x * eta + phi * (state["best_v"] - x) * np.random.rand(NUM_DIMENSIONS)
-        return x + eta * (state["best_v"] - x) #+ np.random.normal(0, 0.1, size=x.shape)  # Add some noise for exploration
+    # eta = 0.6  # "Learning rate"
+    # phi = 2.45
+    # def hs(t, x):
+    #     if state["best_v"] is None:
+    #         return np.zeros_like(x)
+    #     # best_v = state["best_v"]
+    #     # return x + eta * (state["best_v"] - x) + np.random.normal(0, 0.1, size=x.shape)
+    #     # return x * eta + phi * (state["best_v"] - x) * np.random.rand(NUM_DIMENSIONS)
+    #     return x + eta * (state["best_v"] - x) #+ np.random.normal(0, 0.1, size=x.shape)  # Add some noise for exploration
 
-    hs_node     = nengo.Node(
-        label       = "hs",
-        size_in     = NUM_DIMENSIONS,
-        size_out    = NUM_DIMENSIONS,
-        output      = hs
+    # hs_node     = nengo.Node(
+    #     label       = "hs",
+    #     size_in     = NUM_DIMENSIONS,
+    #     size_out    = NUM_DIMENSIONS,
+    #     output      = hs
+    # )
+
+    # --------------------------------------------------------------
+    basal_ganglia = nengo.networks.BasalGanglia(
+        dimensions              = NUM_ACTIONS,        # 3 actions: shrink, hold, reset
+        n_neurons_per_ensemble  = NEURONS_PER_ENS,       # neurons per action ensemble
+    )
+
+    thalamus = nengo.networks.Thalamus(
+        dimensions              = NUM_ACTIONS,        # 3 actions: shrink, hold, reset
+        n_neurons_per_ensemble  = NEURONS_PER_ENS,       # neurons per action ensemble
+    )
+
+    utility_ens = nengo.Ensemble(
+        label                   = "utility",
+        n_neurons               = NEURONS_PER_ENS * NUM_ACTIONS,
+        dimensions              = NUM_ACTIONS,
     )
 
     # Scheduler function to trigger shrink operations
@@ -275,21 +297,36 @@ with model:
         synapse     = None,
     )
 
-    # [EA output] --- x --> [Selector]
+    # [Utility] --- x --> [Basal ganglia]
     nengo.Connection(
-        pre         = ea.output,
-        post        = hs_node,
-        synapse     = 0,
+        pre         = utility_ens,
+        post        = basal_ganglia.input,
+        synapse     = 0.01,
     )
 
-    # [Selector] --- x (delayed) --> [EA input]
-    tau = 0.1
+    # [Basal ganglia] --- action --> [Thalamus]
     nengo.Connection(
-        pre         = hs_node,
-        post        = ea.input,
-        synapse     = tau,
-        transform   = np.eye(NUM_DIMENSIONS),
+        pre         = basal_ganglia.output,
+        post        = thalamus.input,
+        synapse     = 0.01,
     )
+
+
+    # [EA output] --- x --> [Selector]
+    # nengo.Connection(
+    #     pre         = ea.output,
+    #     post        = hs_node,
+    #     synapse     = 0,
+    # )
+
+    # [Selector] --- x (delayed) --> [EA input]
+    # tau = 0.1
+    # nengo.Connection(
+    #     pre         = hs_node,
+    #     post        = ea.input,
+    #     synapse     = tau,
+    #     transform   = np.eye(NUM_DIMENSIONS),
+    # )
 
     # [EA output] --- x --> [Objective function]
     nengo.Connection(
