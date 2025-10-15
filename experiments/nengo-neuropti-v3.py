@@ -11,9 +11,9 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 12  # Problem ID from the IOH framework
+PROBLEM_ID      = 24  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
-NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
+NUM_DIMENSIONS  = 40  # Number of dimensions for the problem
 NEURONS_PER_DIM = 100
 SIMULATION_TIME = 100.0  # seconds
 
@@ -32,9 +32,9 @@ X_UPPER_BOUND0  = X_UPPER_BOUND.copy()
 # Exploitation (search-space shrinking) schedule
 SEED_VALUE      = 69
 DEFAULT_WAIT    = 1.0     # seconds between shrink operations
-STAG_RESET      = 1.1     # seconds of stagnation before a RESET to global bounds
+STAG_RESET      = 1.5     # seconds of stagnation before a RESET to global bounds
 EPS             = 1e-12   # small value to ensure numerical ordering of bounds
-MIN_WIDTH       = 1e-12   # do not shrink any dimension below this absolute width
+MIN_WIDTH       = 1e-6   # do not shrink any dimension below this absolute width
 ACTION_DELAY    = 0.01  # seconds to retarget the EA to the best_v after a shrink
 # MIN_WIDTH_FRAC   = 0.02    # do not shrink any dimension below 2% of the original rang
 
@@ -145,15 +145,15 @@ with model:
             return state["width_proportion"]
 
         # Decide on the action based on improvement and mode
-        if stagnated and can_reset and state["width_proportion"] <= 0.1:
+        if (stagnated and can_reset): # or state["width_proportion"] <= 1e-6:
             proportion                  = -1.0  # RESET to global bounds if stagnated
         elif stagnated:
             proportion = 1.0  # Hold while waiting for cooldown
         else:
-            proportion = 0.8 # Shrink otherwise
+            proportion = 0.7 # Shrink otherwise
 
-        # if np.any(state["ub"] - state["lb"] <= MIN_WIDTH):
-        #     proportion = -1.0  # RESET if any dimension is too small
+        if (state["width_proportion"] <= 1e-4) or np.any(state["ub"] - state["lb"] <= MIN_WIDTH):
+            proportion = -1.0  # RESET if any dimension is too small
 
         # Apply the action: shrink / expand the search space, or RESET to global bounds
         if proportion == -1.0: # RESET action only if in Local mode
