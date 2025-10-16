@@ -36,11 +36,15 @@ NUM_ACTIONS     = len(ACTIONS)
 
 # Exploitation (search-space shrinking) schedule
 SEED_VALUE      = 69
-DEFAULT_WAIT    = 1.0     # seconds between shrink operations
-STAG_RESET      = 1.5     # seconds of stagnation before a RESET to global bounds
-EPS             = 1e-12   # small value to ensure numerical ordering of bounds
-MIN_WIDTH       = 1e-6   # do not shrink any dimension below this absolute width
-ACTION_DELAY    = 0.01  # seconds to retarget the EA to the best_v after a shrink
+INIT_WAIT_TIME  = 0.1
+DEFAULT_WAIT    = 1.0       # seconds between shrink operations
+STAG_RESET      = 3.0       # seconds of stagnation before a RESET to global bounds
+EPS             = 1e-12     # small value to ensure numerical ordering of bounds
+MIN_WIDTH       = 1e-6      # do not shrink any dimension below this absolute width
+MIN_PROPORTION  = 1e-4      # do not shrink the box below this proportion of the original box
+MIN_IMPROVEMENT = 1e-6      # minimum improvement to consider the optimisation progressing
+ACTION_DELAY    = 0.01      # seconds to retarget the EA to the best_v after a shrink
+ALPHA_IMPROV    = 0.9       # EWMA alpha for improvement smoothing
 # MIN_WIDTH_FRAC   = 0.02    # do not shrink any dimension below 2% of the original rang
 
 #%%
@@ -51,92 +55,79 @@ with model:
     # INITIALISATION
     # --------------------------------------------------------------
     v0_state    = tro2s(X_INITIAL_GUESS, X_LOWER_BOUND, X_UPPER_BOUND)
-    # Input nodes for the bounds and initial guess
-    # input_x_l    = nengo.Node(label="x_l", output=X_LOWER_BOUND)
-    # input_x_u    = nengo.Node(label="x_u", output=X_UPPER_BOUND)
-    # input_x_0    = nengo.Node(label="x_0", output=X_INITIAL_GUESS)
 
     # LOCAL STATE
     state = {
-        "lb": X_LOWER_BOUND.copy(),
-        "ub": X_UPPER_BOUND.copy(),
-        "best_x": None,          # best in ORIGINAL space
-        "best_v": v0_state.copy(),
-        "best_f": None,
-        "width_proportion": 1.0,
-        "last_adjust": 0.0,
-        "retarget_until": 0.0,   # time until which we inject best_v after a shrink
-        "last_best_f": None,
-        "wait_time": DEFAULT_WAIT,
-        "last_reset_time": -1e9,
-        "reset_cooldown": 3.0,  # seconds between resets
-        "t_stag_start": 0.0,
+        "lb":               X_LOWER_BOUND.copy(),   # dynamic local bounds
+        "ub":               X_UPPER_BOUND.copy(),
+        "best_x":           None,                   # best in ORIGINAL space
+        "best_v":           v0_state.copy(),        # best in SCALED space
+        "best_f":           None,                   # best objective value
+        "last_best_f":      None,                   # last best objective value
+        "width_proportion": 1.0,                    # current width proportion relative to original box
+        "last_adjust":      0.0,                    # time of last shrink / reset
+        "retarget_until":   0.0,                    # time until which to retarget the EA to best_v
+        "last_reset_time":  -6e9,                   # time of last RESET action
+        "t_stag_start":     0.0,                    # time when stagnation started
+        "wait_time":        DEFAULT_WAIT,           # seconds between shrink/reset operations
+        "reset_cooldown":   3.0,                    # seconds between RESET actions
+        "smoothed_improv":  0.0,                    # smoothed improvement metric
     }
-
-    # Evaluate the objective function
-    def f_obj(t, state_vector):
-        """Evaluate the objective function at the given state vector."""
-        v       = np.clip(state_vector, -1.0, 1.0)  # Ensure within bounds, consider toroidal space later
-        x_vals  = trs2o(v, state["lb"], state["ub"])
-        # Implement here the transformation for integer variables if needed
-        fv      = problem(x_vals)
-        return np.concatenate((v, [fv]))
-
-    state["best_f"]         = f_obj(None, v0_state)[-1]
-    state["last_best_f"]    = state["best_f"]
-    state["best_x"]         = trs2o(state["best_v"], state["lb"], state["ub"])
 
     # DEFINE THE MAIN COMPONENTS
     # --------------------------------------------------------------
 
-    # [Main] Ensemble to represent the current state vector
-    ea          = nengo.networks.EnsembleArray(
-        label           = "Motor EA",
+    # ================[ ENVIRONMENT: OBJECTIVE FUNCTION ]================
+
+    # Evaluate the objective function
+    def obj_func(t, state_vector):
+        """Evaluate the objective function at the given state vector.
+
+        Args:
+            t (float): Current time (not used, yet).
+            state_vector (np.ndarray): State vector in scaled space [-1, 1].
+
+        Returns:
+            np.ndarray: Concatenation of the state vector and its objective value.
+        """
+        v       = np.clip(state_vector, -1.0, 1.0)   # Ensure within [-1, 1]
+        x_vals  = trs2o(v, state["lb"], state["ub"])        # Transform to original space
+
+        fv      = problem(x_vals)                           # Evaluate the objective function
+        return np.concatenate((v, [fv]))
+
+    # Initialise the best-so-far
+    state["best_f"]         = obj_func(None, v0_state)[-1]
+    state["last_best_f"]    = state["best_f"]
+    state["best_x"]         = trs2o(state["best_v"], state["lb"], state["ub"])
+
+    # Objective function node - Equivalent to the Environment in RL
+    obj_node    = nengo.Node(
+        label       = "f_obj",
+        output      = obj_func,
+        size_in     = NUM_DIMENSIONS,
+        size_out    = NUM_DIMENSIONS+1,
+    )
+
+    # ================[ MOTOR ENSEMBLE ]================
+    # Ensemble to represent the current candidate solution
+
+    motor_ens   = nengo.networks.EnsembleArray(
+        label           = "motor",
         n_neurons       = NEURONS_PER_DIM,
         n_ensembles     = NUM_DIMENSIONS,
         ens_dimensions  = 1,
         radius          = 1.0,
-        intercepts  = nengo.dists.Uniform(-0.9, 0.9),
+        intercepts      = nengo.dists.Uniform(-0.9, 0.9),
         # max_rates   = nengo.dists.Uniform(100,220),
-        encoders    = nengo.dists.UniformHypersphere(surface=True),
-        neuron_type     = nengo.AdaptiveLIF(),
+        encoders        = nengo.dists.UniformHypersphere(surface=True),
+        neuron_type     = nengo.LIF(),
         seed            = SEED_VALUE,
     )
 
-    # Pulser function to inject the initial guess at t=0 and best_v after shrinks
-    def pulser(t):
-        if t < 0.01:
-            return v0_state.copy()
-        if t <= state["retarget_until"] and state["best_v"] is not None:
-            return state["best_v"]
-        return np.zeros(NUM_DIMENSIONS)
+    # ================[ BASAL GANGLIA AND THALAMUS ]================
+    # Networks to select actions based on utilities
 
-    # Pulser node to trigger actions
-    pulser_node = nengo.Node(
-        label="pulser",
-        output=pulser,
-        size_out=NUM_DIMENSIONS,
-    )
-
-    # Selector / controller node to move towards the best-so-far
-    # eta = 0.6  # "Learning rate"
-    # phi = 2.45
-    # def hs(t, x):
-    #     if state["best_v"] is None:
-    #         return np.zeros_like(x)
-    #     # best_v = state["best_v"]
-    #     # return x + eta * (state["best_v"] - x) + np.random.normal(0, 0.1, size=x.shape)
-    #     # return x * eta + phi * (state["best_v"] - x) * np.random.rand(NUM_DIMENSIONS)
-    #     return x + eta * (state["best_v"] - x) #+ np.random.normal(0, 0.1, size=x.shape)  # Add some noise for exploration
-
-    # hs_node     = nengo.Node(
-    #     label       = "hs",
-    #     size_in     = NUM_DIMENSIONS,
-    #     size_out    = NUM_DIMENSIONS,
-    #     output      = hs
-    # )
-
-    # --------------------------------------------------------------
     basal_ganglia = nengo.networks.BasalGanglia(
         dimensions              = NUM_ACTIONS,        # 3 actions: shrink, hold, reset
         n_neurons_per_ensemble  = NEURONS_PER_ENS,       # neurons per action ensemble
@@ -147,97 +138,166 @@ with model:
         n_neurons_per_ensemble  = NEURONS_PER_ENS,       # neurons per action ensemble
     )
 
-    utility_ens = nengo.Ensemble(
-        label                   = "utility",
-        n_neurons               = NEURONS_PER_ENS * NUM_ACTIONS,
-        dimensions              = NUM_ACTIONS,
+    # ================[ UTILITY ENSEMBLE ]================
+    # Ensemble to represent the utility of each action
+
+    def _sigmoid(z):
+        return 1.0 / (1.0 + np.exp(-z))
+
+    def utility_func(t, best_f):
+        """Compute utilities for each action based on the current state.
+        """
+        bf              = float(best_f.item())
+
+        # Improvement since last step (minimisation)
+        difference      = max(0.0, state["last_best_f"] - bf)
+        denominator     = EPS + abs(state["last_best_f"])
+        improvement     = difference / denominator
+
+        # Update stagnation timer
+        if bf < state["last_best_f"] - MIN_IMPROVEMENT:
+            state["t_stag_start"] = t
+        state["last_best_f"] = bf
+
+        smi = state["smoothed_improv"]  = (1 - ALPHA_IMPROV) * state["smoothed_improv"] + ALPHA_IMPROV * improvement
+
+        # Status flags
+        stagnated   = (t - state["t_stag_start"]) >= STAG_RESET
+        can_reset   = (t - state["last_reset_time"]) >= state["reset_cooldown"]
+        too_narrow  = (state["width_proportion"] <= MIN_PROPORTION) or np.any((state["ub"] - state["lb"]) <= MIN_WIDTH)
+        in_cooldown = (t - state["last_adjust"]) < state["wait_time"]
+
+        # Utilities
+        _imp_val    = np.clip(_sigmoid(smi) * 10.0, 0.0, 1.0)
+        shrink_u = 0.7 * _imp_val \
+                     + (0.3 if not too_narrow else 0.0) \
+                     - (0.4 if in_cooldown else 0.0)
+
+        hold_u   = (1.0 if in_cooldown else 0.0)
+
+        reset_u  = (1.0 if (stagnated or too_narrow) else 0.0) \
+                   + (1.0 if can_reset else 0.0) \
+                   - (0.5 if in_cooldown else 0.0) \
+                   - 0.5 * _imp_val
+
+        # if reset_u > shrink_u and reset_u > hold_u:
+        #     print(f"\nt: {t:2f}", "stagnated:", stagnated, "can_reset:", can_reset,
+        #           "in_cooldown:", in_cooldown, "width_prop:", state["width_proportion"],
+        #           "too_narrow:", too_narrow, f"smi: {smi:.4e}", f"_imp_val: {_imp_val:.2f}",
+        #             f"u: [{shrink_u:.2f}, {hold_u:.2f}, {reset_u:.2f}]"
+        #           )
+
+        return np.array([shrink_u, hold_u, reset_u], dtype=float)
+
+    utility_ens = nengo.Node(
+        label       = "utility",
+        output      = utility_func,
+        size_in     = 1,
+        size_out    = NUM_ACTIONS,
+    )
+
+    def premotor_func(t, action_vector):
+        """Pre-motor function to modulate the motor ensemble based on the selected action.
+        """
+        if t < INIT_WAIT_TIME:
+            return 1.0  # HOLD during initialisation
+
+        action_values   = action_vector
+        action_idx      = int(np.argmax(action_values))
+        action          = ACTIONS[action_idx]
+
+        if action == "SHRINK":
+            # smi         = state["smoothed_improv"]
+            # base        = 0.35 + 0.45 * float(np.clip(1.0 - 10.0 * smi, 0.0, 1.0))
+            # proportion  = float(np.clip(base, 0.05, 0.8))
+            proportion  = np.random.uniform(0.25, 0.5)
+            # proportion  = 0.5
+        elif action == "HOLD":
+            proportion  = 1.0  # Keep the search space unchanged
+        elif action == "RESET":
+            proportion  = -1.0 # RESET to global bounds
+        else:
+            proportion  = 1.0  # Default to HOLD
+
+        return proportion
+
+    premotor_node = nengo.Node(
+        label       = "premotor",
+        output      = premotor_func,
+        size_in     = NUM_ACTIONS,
+        size_out    = 1,
     )
 
     # Scheduler function to trigger shrink operations
-    def neuromodulator(t, best_f):
-        if best_f.item() < state["last_best_f"]:
-            state["t_stag_start"] = t
-            state["last_best_f"] = best_f.item()
+    def reframing_func(t, input_vector):
+        # Read the current position and the action proportion
+        current_v   = input_vector[:-1]
+        proportion  = input_vector[-1]
 
-        stagnated   = (t - state["t_stag_start"]) >= STAG_RESET
-        can_reset   = (t - state["last_reset_time"]) >= state["reset_cooldown"]
+        if (state["best_v"] is None) or (t < INIT_WAIT_TIME) \
+                or (proportion > 1.0 - MIN_PROPORTION) \
+                or (t - state["last_adjust"] < state["wait_time"]): \
+                # or (t < state["retarget_until"]):
+            # HOLD action: do nothing
+            return current_v
 
-        # Trigger every wait_time seconds after a short warmup
-        if (state["best_v"] is None) or (t < 0.1) or (
-                (t - state["last_adjust"] < state["wait_time"])):
-            return state["width_proportion"]
-
-        # Decide on the action based on improvement and mode
-        if (stagnated and can_reset): # or state["width_proportion"] <= 1e-6:
-            proportion                  = -1.0  # RESET to global bounds if stagnated
-        elif stagnated:
-            proportion = 1.0  # Hold while waiting for cooldown
-        else:
-            proportion = np.random.uniform(0.25, 0.5) # Shrink otherwise
-
-        if (state["width_proportion"] <= 1e-4) or np.any(state["ub"] - state["lb"] <= MIN_WIDTH):
-            proportion = -1.0  # RESET if any dimension is too small
-
-        # Apply the action: shrink / expand the search space, or RESET to global bounds
-        if proportion == -1.0: # RESET action only if in Local mode
-            # RESET: restore original global bounds and width proportion
-            new_lb = X_LOWER_BOUND0.copy()
-            new_ub = X_UPPER_BOUND0.copy()
-            state["width_proportion"] = 1.0
+        if proportion < 0.0: # RESET action only if in Local mode
+            state["width_proportion"]   = 1.0
+            new_lb, new_ub              = X_LOWER_BOUND0.copy(), X_UPPER_BOUND0.copy()
 
             # Recompute best_v under the RESET bounds
             if state["best_x"] is not None:
-                new_best_v          = tro2s(state["best_x"], new_lb, new_ub)
+                new_best_v              = tro2s(state["best_x"], new_lb, new_ub)
             else:
-                new_best_v = tro2s(X_INITIAL_GUESS, new_lb, new_ub)
+                new_best_v              = tro2s(X_INITIAL_GUESS, new_lb, new_ub)
 
             state["best_x"]             = trs2o(new_best_v, new_lb, new_ub)
             state["last_reset_time"]    = t
-            state["last_adjust"]        = t - state["wait_time"]
 
         else:
+            proportion  = max(MIN_PROPORTION, min(1.0, proportion))
+
             # Current widths and target widths after shrinking
             half_width  = 0.5 * np.maximum(
                 (state["ub"] - state["lb"]) * proportion,  MIN_WIDTH
             )
 
-            # Center the new box around the current best (in original space)
-            center      = trs2o(state["best_v"], state["lb"], state["ub"])
+            # Centrer the new box around the current best (in original space)
+            centre      = trs2o(state["best_v"], state["lb"], state["ub"])
+
             # Enforce minimum width and clip to global box
-            new_lb      = np.maximum(center - half_width, X_LOWER_BOUND0)
-            new_ub      = np.minimum(center + half_width, X_UPPER_BOUND0)
+            new_lb      = np.maximum(centre - half_width, X_LOWER_BOUND0)
+            new_ub      = np.minimum(centre + half_width, X_UPPER_BOUND0)
 
             # Ensure numerical ordering
             new_lb      = np.minimum(new_lb, new_ub - EPS)
             new_ub      = np.maximum(new_ub, new_lb + EPS)
 
             # Recompute best_v under the NEW bounds so it stays centred on the same best_x
-            new_best_v  = tro2s(state["best_x"], new_lb, new_ub) \
-                if state["best_x"] is not None else state["best_v"]
+            new_best_v  = tro2s(state["best_x"], new_lb, new_ub) if state["best_x"] is not None else state["best_v"]
 
-            state["width_proportion"]   *= proportion
-            state["last_adjust"]        = t
-            state["t_stag_start"]       = t
+            # Track the current width proportion
+            state["width_proportion"]   = min(1.0, max(MIN_PROPORTION, state["width_proportion"] * proportion))
+
+        state["last_adjust"]        = t
 
         # Update the local state
         state["lb"], state["ub"]    = new_lb, new_ub
         state["best_v"]             = np.clip(new_best_v, -1.0, 1.0)
         state["retarget_until"]     = t + ACTION_DELAY
 
-        # print(t, state["lb"], state["ub"], state["width_proportion"], flush=True)
-
-        return state["width_proportion"]
+        return current_v
 
     # Scheduler node to trigger shrink operations
-    shrink_node = nengo.Node(
-        label       = "neuromodulator",
-        output      = neuromodulator,
-        size_out    = 1,
-        size_in     = 1,
+    reframing_node = nengo.Node(
+        label       = "reframing",
+        output      = reframing_func,
+        size_in     = NUM_DIMENSIONS + 1,
+        size_out    = NUM_DIMENSIONS,
     )
 
     # Selector node to keep track of the best-so-far
-    def local_selector(t, x):
+    def selector_func(t, x):
         v       = x[:NUM_DIMENSIONS]
         fv      = float(x[NUM_DIMENSIONS])
 
@@ -251,9 +311,6 @@ with model:
             # store best in ORIGINAL space under current dynamic bounds
             state["best_x"] = trs2o(state["best_v"], state["lb"], state["ub"])
 
-            # Reset stagnation counter
-            # state["t_stag_start"] = t
-
         if state["best_v"] is None:
             return np.concatenate((v, [fv]))
         else:
@@ -261,19 +318,46 @@ with model:
 
     selector_node   = nengo.Node(
         label       = "selector",
-        output      = local_selector,
+        output      = selector_func,
         size_in     = NUM_DIMENSIONS + 1,
         size_out    = NUM_DIMENSIONS + 1,
     )
 
-    # Objective function node
-    obj_node    = nengo.Node(
-        label       = "f_obj",
-        output      = f_obj,
+    # Selector / controller node to move towards the best-so-far
+    eta = 0.6  # "Learning rate"
+    phi = 2.45
+    def hs(t, x):
+        if state["best_v"] is None:
+            return np.zeros_like(x)
+        # best_v = state["best_v"]
+        # return x + eta * (state["best_v"] - x) + np.random.normal(0, 0.1, size=x.shape)
+        # return x * eta + phi * (state["best_v"] - x) * np.random.rand(NUM_DIMENSIONS)
+        return x + eta * (state["best_v"] - x) + np.random.normal(0, 0.03, size=x.shape)  # Add some noise for exploration
+
+    hs_node     = nengo.Node(
+        label       = "hs",
         size_in     = NUM_DIMENSIONS,
-        size_out    = NUM_DIMENSIONS+1,
+        size_out    = NUM_DIMENSIONS,
+        output      = hs
     )
 
+
+    # Pulser function to inject the initial guess at t=0 and best_v after shrinks
+    def pulser_func(t):
+        if t < 0.01:
+            return v0_state.copy()
+        if t <= state["retarget_until"] and state["best_v"] is not None:
+            return state["best_v"]
+        return np.zeros(NUM_DIMENSIONS)
+
+    # Pulser node to trigger actions
+    pulser_node = nengo.Node(
+        label="pulser",
+        output=pulser_func,
+        size_out=NUM_DIMENSIONS,
+    )
+
+    # TODO: this could be a memory
     # [Aux] Nodes to extract only fbest and xbest from the selector output
     fbest_only = nengo.Node(
         size_in     = NUM_DIMENSIONS+1,
@@ -293,7 +377,7 @@ with model:
     # [Pulser] --- v --> [EA input]
     nengo.Connection(
         pre         = pulser_node,
-        post        = ea.input,
+        post        = motor_ens.input,
         synapse     = None,
     )
 
@@ -311,34 +395,61 @@ with model:
         synapse     = 0.01,
     )
 
+    # [Thalamus] --- action --> [Premotor]
+    nengo.Connection(
+        pre         = thalamus.output,
+        post        = premotor_node,
+        synapse     = 0.01,
+    )
+
+    # [Premotor] --- proportion --> [Reframing]
+    nengo.Connection(
+        pre         = premotor_node,
+        post        = reframing_node[-1],
+        synapse     = 0.01,
+    )
 
     # [EA output] --- x --> [Selector]
-    # nengo.Connection(
-    #     pre         = ea.output,
-    #     post        = hs_node,
-    #     synapse     = 0,
-    # )
+    nengo.Connection(
+        pre         = motor_ens.output,
+        post        = hs_node,
+        synapse     = 0,
+    )
 
     # [Selector] --- x (delayed) --> [EA input]
-    # tau = 0.1
-    # nengo.Connection(
-    #     pre         = hs_node,
-    #     post        = ea.input,
-    #     synapse     = tau,
-    #     transform   = np.eye(NUM_DIMENSIONS),
-    # )
+    tau = 0.1
+    nengo.Connection(
+        pre         = hs_node,
+        post        = motor_ens.input,
+        synapse     = tau,
+        transform   = np.eye(NUM_DIMENSIONS),
+    )
 
     # [EA output] --- x --> [Objective function]
     nengo.Connection(
-        pre         = ea.output,
-        post        = obj_node,
+        pre         = motor_ens.output,
+        post        = reframing_node[:-1],
         synapse     = 0,
+    )
+
+    # [Reframing] -> [Objective function]
+    nengo.Connection(
+        pre        = reframing_node,
+        post       = obj_node,
+        synapse    = 0,
     )
 
     # [Objective function] --- (x,f) --> [Selector]
     nengo.Connection(
         pre         = obj_node,
         post        = selector_node,
+        synapse     = 0,
+    )
+
+    # [Selector] --- (fbest) ---> [Utility]
+    nengo.Connection(
+        pre         = selector_node[-1],
+        post        = utility_ens,
         synapse     = 0,
     )
 
@@ -349,12 +460,6 @@ with model:
         synapse     = 0,
     )
 
-    # [Selector] --- f --> [shrink_scheduler]
-    nengo.Connection(
-        pre        = selector_node[-1],
-        post       = shrink_node,
-        synapse    = 0,
-    )
 
     # [Selector] --- xbest --> [xbest_only]
     nengo.Connection(
@@ -363,14 +468,26 @@ with model:
         synapse     = 0,
     )
 
+    def _proportion_func(t):
+        # if t < state["retarget_until"]:
+        return state["width_proportion"]
+        # return 1.0
+
+    _proportion_node = nengo.Node(
+        label       = "proportion",
+        size_in     = 0,
+        size_out    = 1,
+        output      = _proportion_func,
+    )
+
     # PROBES
     # --------------------------------------------------------------
-    shrink_trigger  = nengo.Probe(shrink_node, synapse=None)
-    ens_lif_val     = nengo.Probe(ea.output, synapse=0.01)  # 10ms filter
+    shrink_trigger  = nengo.Probe(_proportion_node, synapse=None)
+    ens_lif_val     = nengo.Probe(motor_ens.output, synapse=0.01)  # 10ms filter
     obj_val         = nengo.Probe(obj_node[-1], synapse=0)
     fbest_val       = nengo.Probe(fbest_only, synapse=0.01)
     xbest_val       = nengo.Probe(xbest_only, synapse=0.01)
-    ea_spk          = [nengo.Probe(ens.neurons, synapse=0.01) for ens in ea.ensembles]
+    ea_spk          = [nengo.Probe(ens.neurons, synapse=0.01) for ens in motor_ens.ensembles]
 
 #%%
 # Create our simulator
@@ -378,6 +495,8 @@ with nengo.Simulator(model) as sim:
     sim.reset(seed=69)
     # Run it for 1 second
     sim.run(SIMULATION_TIME)
+
+
 
 #%%
 print("Evals", len(sim.data[obj_val]))
@@ -478,4 +597,3 @@ spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
 rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
 plt.xlim(0, SIMULATION_TIME)
 plt.show()
-

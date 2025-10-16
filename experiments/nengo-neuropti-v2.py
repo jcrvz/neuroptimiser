@@ -95,8 +95,8 @@ with model:
     tau     = 0.1
     # nengo.Connection(
     #     label       = "recurrent",
-    #     pre         = ea.output,
-    #     post        = ea.input,
+    #     pre         = motor_ens.output,
+    #     post        = motor_ens.input,
     #     synapse     = tau,
     #     function    = hs,
     #     transform   = np.eye(NUM_DIMENSIONS),
