@@ -47,6 +47,11 @@ ACTION_DELAY    = 0.01      # seconds to retarget the EA to the best_v after a s
 ALPHA_IMPROV    = 0.9       # EWMA alpha for improvement smoothing
 # MIN_WIDTH_FRAC   = 0.02    # do not shrink any dimension below 2% of the original rang
 
+# Q learning parameters
+ALPHA_Q         = 0.1       # learning rate
+GAMMA_Q         = 0.9       # discount factor
+SOFTMAX_TEMP    = 1.0       # softmax temperature for action selection
+
 #%%
 
 # Create the Nengo model
@@ -63,15 +68,18 @@ with model:
         "best_x":           None,                   # best in ORIGINAL space
         "best_v":           v0_state.copy(),        # best in SCALED space
         "best_f":           None,                   # best objective value
-        "last_best_f":      None,                   # last best objective value
         "width_proportion": 1.0,                    # current width proportion relative to original box
         "last_adjust":      0.0,                    # time of last shrink / reset
         "retarget_until":   0.0,                    # time until which to retarget the EA to best_v
-        "last_reset_time":  -6e9,                   # time of last RESET action
+        "last_reset_time":  0.0,                   # time of last RESET action
         "t_stag_start":     0.0,                    # time when stagnation started
-        "wait_time":        DEFAULT_WAIT,           # seconds between shrink/reset operations
-        "reset_cooldown":   3.0,                    # seconds between RESET actions
+        "wait_time":        0.1,           # seconds between shrink/reset operations
+        "reset_cooldown":   5.0,                    # seconds between RESET actions
         "smoothed_improv":  0.0,                    # smoothed improvement metric
+        "q_w":               None,                   # weights: shape (NUM_ACTIONS, NUM_FEATURES)
+        "prev_features":    None,                   # previous features: shape (NUM_FEATURES,)
+        "prev_action":      None,                   # previous action index executed
+        "prev_best_f":      None,                   # previous best objective value
     }
 
     # DEFINE THE MAIN COMPONENTS
@@ -98,7 +106,7 @@ with model:
 
     # Initialise the best-so-far
     state["best_f"]         = obj_func(None, v0_state)[-1]
-    state["last_best_f"]    = state["best_f"]
+    state["prev_best_f"]    = state["best_f"]
     state["best_x"]         = trs2o(state["best_v"], state["lb"], state["ub"])
 
     # Objective function node - Equivalent to the Environment in RL
@@ -141,52 +149,85 @@ with model:
     # ================[ UTILITY ENSEMBLE ]================
     # Ensemble to represent the utility of each action
 
+    def _features_func(t):
+        """Extract features from the current state for utility computation.
+        """
+
+        # Read the current improvement
+        smi         = np.clip(state["smoothed_improv"], 0.0, 1.0)
+
+        # Stagnation degree
+        stag_time       = max(0.0, t - state["t_stag_start"])
+        stagnation_deg  = np.clip(stag_time / STAG_RESET, 0.0, 1.0)
+
+        # Cooldown degree
+        cool_left       = max(0.0, state["wait_time"] - (t - state["last_adjust"]))
+        cooldown_deg    = np.clip(1.0 - (cool_left / state["wait_time"]), 0.0, 1.0)
+
+        # Narrowness degree
+        width_prop      = np.clip(state["width_proportion"], 0.0, 1.0)
+        if width_prop <= MIN_PROPORTION:
+            narrowness_deg = 1.0
+        else:
+            narrowness_deg = np.clip((1.0 - width_prop) / (1.0 - MIN_PROPORTION), 0.0, 1.0)
+
+        # Can-reset degree
+        since_reset     = t - state["last_reset_time"]
+        reset_deg       = np.clip(since_reset / state["reset_cooldown"], 0.0, 1.0)
+
+        return np.array(
+            [1.0, smi, stagnation_deg, cooldown_deg, narrowness_deg, reset_deg],
+            dtype=float)
+
     def _sigmoid(z):
         return 1.0 / (1.0 + np.exp(-z))
 
     def utility_func(t, best_f):
         """Compute utilities for each action based on the current state.
         """
-        bf              = float(best_f.item())
+        bf  = float(best_f.item())
+
+        if state["q_w"] is None:
+            rng                     = np.random.default_rng(SEED_VALUE)
+            state["q_w"]            = rng.normal(0.0, 1e-3, size=(NUM_ACTIONS, 6))  # 6 features
 
         # Improvement since last step (minimisation)
-        difference      = max(0.0, state["last_best_f"] - bf)
-        denominator     = EPS + abs(state["last_best_f"])
-        improvement     = difference / denominator
+        difference                  = max(0.0, state["prev_best_f"] - bf)
+        denominator                 = EPS + abs(state["prev_best_f"])
+        improvement                 = difference / denominator
+        state["smoothed_improv"]    = (1 - ALPHA_IMPROV) * state["smoothed_improv"] + ALPHA_IMPROV * improvement
 
         # Update stagnation timer
-        if bf < state["last_best_f"] - MIN_IMPROVEMENT:
+        if bf < state["prev_best_f"] - MIN_IMPROVEMENT:
             state["t_stag_start"] = t
-        state["last_best_f"] = bf
+        state["prev_best_f"] = bf
 
-        smi = state["smoothed_improv"]  = (1 - ALPHA_IMPROV) * state["smoothed_improv"] + ALPHA_IMPROV * improvement
+        # Get the features
+        features                    = _features_func(t)
 
-        # Status flags
-        stagnated   = (t - state["t_stag_start"]) >= STAG_RESET
-        can_reset   = (t - state["last_reset_time"]) >= state["reset_cooldown"]
-        too_narrow  = (state["width_proportion"] <= MIN_PROPORTION) or np.any((state["ub"] - state["lb"]) <= MIN_WIDTH)
-        in_cooldown = (t - state["last_adjust"]) < state["wait_time"]
+        # TD(0) update of Q-values for the previous action (recorded in premotor)
+        if state["prev_features"] is not None and state["prev_action"] is not None:
+            # Compute Q-values for current state, boostrapped (i.e., max_a Q(s',a))
+            q_next      = state["q_w"] @ features
+            target      = improvement + GAMMA_Q * np.max(q_next)
+            q_prev      = state["q_w"][state["prev_action"], :] @ state["prev_features"]
+            td_error    = target - q_prev
 
-        # Utilities
-        _imp_val    = np.clip(_sigmoid(smi) * 10.0, 0.0, 1.0)
-        shrink_u = 0.7 * _imp_val \
-                     + (0.3 if not too_narrow else 0.0) \
-                     - (0.4 if in_cooldown else 0.0)
+            # Update weights for the previous action
+            state["q_w"][state["prev_action"], :] += ALPHA_Q * td_error * state["prev_features"]
 
-        hold_u   = (1.0 if in_cooldown else 0.0)
+        # Compute current Q-values for all actions
+        q_now   = state["q_w"] @ features
 
-        reset_u  = (1.0 if (stagnated or too_narrow) else 0.0) \
-                   + (1.0 if can_reset else 0.0) \
-                   - (0.5 if in_cooldown else 0.0)
+        # Softmax to get action probabilities
+        logits     = (q_now - np.max(q_now)) / max(1e3 * EPS, SOFTMAX_TEMP)
+        expvals    = np.exp(np.clip(logits, -50, 50))
+        probs       = expvals / (np.sum(expvals) + EPS)
 
-        # if reset_u > shrink_u and reset_u > hold_u:
-        #     print(f"\nt: {t:2f}", "stagnated:", stagnated, "can_reset:", can_reset,
-        #           "in_cooldown:", in_cooldown, "width_prop:", state["width_proportion"],
-        #           "too_narrow:", too_narrow, f"smi: {smi:.4e}", f"_imp_val: {_imp_val:.2f}",
-        #             f"u: [{shrink_u:.2f}, {hold_u:.2f}, {reset_u:.2f}]"
-        #           )
+        # Store current features for next update
+        state["prev_features"]  = features
 
-        return np.array([shrink_u, hold_u, reset_u], dtype=float)
+        return probs.astype(float)
 
     utility_ens = nengo.Node(
         label       = "utility",
@@ -201,16 +242,18 @@ with model:
         if t < INIT_WAIT_TIME:
             return 1.0  # HOLD during initialisation
 
-        action_values   = action_vector
-        action_idx      = int(np.argmax(action_values))
-        action          = ACTIONS[action_idx]
+        action_values           = action_vector
+        action_idx              = int(np.argmax(action_values))
+        action                  = ACTIONS[action_idx]
+        state["prev_action"]    = action_idx
 
         if action == "SHRINK":
             # smi         = state["smoothed_improv"]
             # base        = 0.35 + 0.45 * float(np.clip(1.0 - 10.0 * smi, 0.0, 1.0))
             # proportion  = float(np.clip(base, 0.05, 0.8))
             # proportion  = 0.15 + 0.85 * state["width_proportion"]
-            proportion  = 0.5
+            proportion  = np.random.uniform(0.25, 0.5)
+            # proportion  = 0.5
         elif action == "HOLD":
             proportion  = 1.0  # Keep the search space unchanged
         elif action == "RESET":
@@ -284,7 +327,7 @@ with model:
         # Update the local state
         state["lb"], state["ub"]    = new_lb, new_ub
         state["best_v"]             = np.clip(new_best_v, -1.0, 1.0)
-        state["retarget_until"]     = t + ACTION_DELAY
+        # state["retarget_until"]     = t + ACTION_DELAY
 
         return current_v
 
@@ -347,8 +390,8 @@ with model:
     def pulser_func(t):
         if t < 0.01:
             return v0_state.copy()
-        if t <= state["retarget_until"] and state["best_v"] is not None:
-            return state["best_v"]
+        # if t <= state["retarget_until"] and state["best_v"] is not None:
+        #     return state["best_v"]
         return np.zeros(NUM_DIMENSIONS)
 
     # Pulser node to trigger actions
@@ -600,9 +643,9 @@ plt.show()
 
 action_data = sim.data[utility_vals]
 
-plt.figure(figsize=(10, 5))
+# plt.figure(figsize=(10, 5))
 
-offsets = [-0.5, 0.0, 0.5]
+offsets = [0] * 3 #[-0.5, 0.0, 0.5]
 for i, action_label in enumerate(ACTIONS):
     action_label = action_label
     plt.plot(sim.trange() + offsets[i], action_data[:, i], '-',
