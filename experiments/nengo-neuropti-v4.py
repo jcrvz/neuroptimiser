@@ -15,8 +15,8 @@ PROBLEM_ID      = 12  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
 NEURONS_PER_DIM = 100
-NEURONS_PER_ENS = 50
-SIMULATION_TIME = 50.0  # seconds
+NEURONS_PER_ENS = 20
+SIMULATION_TIME = 20.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMENSIONS)
 problem.reset()
@@ -121,7 +121,7 @@ with model:
         intercepts      = nengo.dists.Uniform(-0.9, 0.9),
         # max_rates   = nengo.dists.Uniform(100,220),
         encoders        = nengo.dists.UniformHypersphere(surface=True),
-        neuron_type     = nengo.LIF(),
+        neuron_type     = nengo.AdaptiveLIF(),
         seed            = SEED_VALUE,
     )
 
@@ -177,8 +177,7 @@ with model:
 
         reset_u  = (1.0 if (stagnated or too_narrow) else 0.0) \
                    + (1.0 if can_reset else 0.0) \
-                   - (0.5 if in_cooldown else 0.0) \
-                   - 0.5 * _imp_val
+                   - (0.5 if in_cooldown else 0.0)
 
         # if reset_u > shrink_u and reset_u > hold_u:
         #     print(f"\nt: {t:2f}", "stagnated:", stagnated, "can_reset:", can_reset,
@@ -210,8 +209,8 @@ with model:
             # smi         = state["smoothed_improv"]
             # base        = 0.35 + 0.45 * float(np.clip(1.0 - 10.0 * smi, 0.0, 1.0))
             # proportion  = float(np.clip(base, 0.05, 0.8))
-            proportion  = np.random.uniform(0.25, 0.5)
-            # proportion  = 0.5
+            # proportion  = 0.15 + 0.85 * state["width_proportion"]
+            proportion  = 0.5
         elif action == "HOLD":
             proportion  = 1.0  # Keep the search space unchanged
         elif action == "RESET":
@@ -234,9 +233,10 @@ with model:
         current_v   = input_vector[:-1]
         proportion  = input_vector[-1]
 
+        in_cooldown = (t - state["last_adjust"]) < state["wait_time"]
         if (state["best_v"] is None) or (t < INIT_WAIT_TIME) \
                 or (proportion > 1.0 - MIN_PROPORTION) \
-                or (t - state["last_adjust"] < state["wait_time"]): \
+                or (in_cooldown and proportion >= 0.0): \
                 # or (t < state["retarget_until"]):
             # HOLD action: do nothing
             return current_v
@@ -324,15 +324,16 @@ with model:
     )
 
     # Selector / controller node to move towards the best-so-far
-    eta = 0.6  # "Learning rate"
-    phi = 2.45
     def hs(t, x):
         if state["best_v"] is None:
             return np.zeros_like(x)
-        # best_v = state["best_v"]
-        # return x + eta * (state["best_v"] - x) + np.random.normal(0, 0.1, size=x.shape)
-        # return x * eta + phi * (state["best_v"] - x) * np.random.rand(NUM_DIMENSIONS)
-        return x + eta * (state["best_v"] - x) + np.random.normal(0, 0.03, size=x.shape)  # Add some noise for exploration
+
+        in_cooldown = (t - state["last_adjust"]) < state["wait_time"]
+
+        eta     = 0.8 if in_cooldown else 0.2
+        sigma   = 0.01 if in_cooldown else 0.08
+
+        return x + eta * (state["best_v"] - x) + np.random.normal(0, sigma, size=NUM_DIMENSIONS)
 
     hs_node     = nengo.Node(
         label       = "hs",
@@ -489,6 +490,8 @@ with model:
     xbest_val       = nengo.Probe(xbest_only, synapse=0.01)
     ea_spk          = [nengo.Probe(ens.neurons, synapse=0.01) for ens in motor_ens.ensembles]
 
+    utility_vals    = nengo.Probe(utility_ens, synapse=0.01)
+
 #%%
 # Create our simulator
 with nengo.Simulator(model) as sim:
@@ -539,6 +542,9 @@ def add_colors():
 add_colors()
 plt.plot(sim.trange(), action_proportions, color="black")
 plt.show()
+
+
+
 
 #%%
 # plt.figure()
@@ -591,9 +597,25 @@ plt.title(f"Obj. func. err. vs time | fbest: {sim.data[fbest_val][-1][0]:.2f} ::
 plt.show()
 
 #%%
-# Plot the spiking output of the ensemble
-plt.figure()
-spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
-rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
-plt.xlim(0, SIMULATION_TIME)
+
+action_data = sim.data[utility_vals]
+
+plt.figure(figsize=(10, 5))
+
+offsets = [-0.5, 0.0, 0.5]
+for i, action_label in enumerate(ACTIONS):
+    action_label = action_label
+    plt.plot(sim.trange() + offsets[i], action_data[:, i], '-',
+             label=action_label, markersize=2)
+plt.xlim(offsets[0], SIMULATION_TIME)
+plt.legend()
+plt.title("Action utilities over time")
 plt.show()
+
+#%%
+# Plot the spiking output of the ensemble
+# plt.figure()
+# spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
+# rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
+# plt.xlim(0, SIMULATION_TIME)
+# plt.show()
