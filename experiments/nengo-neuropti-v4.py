@@ -13,12 +13,12 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 1  # Problem ID from the IOH framework
+PROBLEM_ID      = 3  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
 NEURONS_PER_DIM = 100
 NEURONS_PER_ENS = 20
-SIMULATION_TIME = 20.0  # seconds
+SIMULATION_TIME = 10.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMENSIONS)
 problem.reset()
@@ -58,10 +58,6 @@ MIN_IMPROVEMENT = 1e-6      # minimum improvement to consider the optimisation p
 ACTION_DELAY    = 0.01      # seconds to retarget the EA to the best_v after a shrink
 ALPHA_IMPROV    = 0.99       # EWMA alpha for improvement smoothing / depends on dt
 
-
-# Q learning parameters
-ALPHA_Q         = 0.1       # learning rate
-GAMMA_Q         = 0.9       # discount factor
 SOFTMAX_TEMP    = 1.0       # softmax temperature for action selection
 
 #%%
@@ -262,8 +258,10 @@ with model:
             state["best_x"]             = trs2o(new_best_v, new_lb, new_ub)
             state["t_last_reset"]       = t
             # state["t_stag_start"]       = t
-            # state["smoothed_improv"]    = 0.0
+            state["smoothed_improv"]    = 0.0
             state["prev_best_f"]        = 6e9
+
+            v0_state                    = new_best_v.copy() + np.random.normal(0, 0.01, size=NUM_DIMENSIONS)
 
         else:
             proportion  = max(MIN_PROPORTION, min(1.0, proportion))
@@ -412,10 +410,10 @@ with model:
 
     # Pulser function to inject the initial guess at t=0 and best_v after shrinks
     def pulser_func(t):
-        if t < 0.01:
+        if (t < 0.01) or (t <= state["retarget_until"]):
             return v0_state.copy()
-        if t <= state["retarget_until"] and state["best_v"] is not None:
-            return state["best_v"] + np.random.normal(0, 0.01, size=NUM_DIMENSIONS)
+        # if t <= state["retarget_until"] and state["best_v"] is not None:
+            # return state["best_v"] + np.random.normal(0, 0.01, size=NUM_DIMENSIONS)
         return np.zeros(NUM_DIMENSIONS)
 
     # Pulser node to trigger actions
