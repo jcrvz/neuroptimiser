@@ -13,7 +13,7 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 12  # Problem ID from the IOH framework
+PROBLEM_ID      = 1  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
 NEURONS_PER_DIM = 100
@@ -48,17 +48,16 @@ NUM_ACTIONS     = len(ACTIONS)
 # Exploitation (search-space shrinking) schedule
 SEED_VALUE      = 69
 INIT_WAIT_TIME  = 0.1
-DEFAULT_WAIT    = 0.5       # seconds between action operations
-STAG_WAIT       = 2.0       # seconds of stagnation before a RESET to global bounds
+DEFAULT_WAIT    = 0.2       # seconds between action operations
+STAG_WAIT       = 0.5       # seconds of stagnation before a RESET to global bounds
+RESET_COOLDOWN  = 1.0   # seconds between RESET actions
 EPS             = 1e-12     # small value to ensure numerical ordering of bounds
 MIN_WIDTH       = 1e-6      # do not shrink any dimension below this absolute width
 MIN_PROPORTION  = 1e-4      # do not shrink the box below this proportion of the original box
 MIN_IMPROVEMENT = 1e-6      # minimum improvement to consider the optimisation progressing
 ACTION_DELAY    = 0.01      # seconds to retarget the EA to the best_v after a shrink
-ALPHA_IMPROV    = 0.999       # EWMA alpha for improvement smoothing / depends on dt
-# MIN_WIDTH_FRAC   = 0.02    # do not shrink any dimension below 2% of the original rang
+ALPHA_IMPROV    = 0.99       # EWMA alpha for improvement smoothing / depends on dt
 
-RESET_COOLDOWN  = 2.0   # seconds between RESET actions
 
 # Q learning parameters
 ALPHA_Q         = 0.1       # learning rate
@@ -151,21 +150,26 @@ with model:
     # ================[ BASAL GANGLIA AND THALAMUS ]================
     # Networks to select actions based on utilities
 
-    # basal_ganglia = nengo.networks.BasalGanglia(
-    #     dimensions              = NUM_ACTIONS,        # 2 actions: shrink, reset
-    #     n_neurons_per_ensemble  = NEURONS_PER_ENS,       # neurons per action ensemble
-    # )
-    #
-    # thalamus = nengo.networks.Thalamus(
-    #     dimensions              = NUM_ACTIONS,        # 2 actions: shrink, reset
-    #     n_neurons_per_ensemble  = NEURONS_PER_ENS,       # neurons per action ensemble
-    # )
+    basal_ganglia = nengo.networks.BasalGanglia(
+        dimensions              = NUM_ACTIONS,        # 2 actions: shrink, reset
+        n_neurons_per_ensemble  = NEURONS_PER_ENS,       # neurons per action ensemble
+    )
+
+    thalamus = nengo.networks.Thalamus(
+        dimensions              = NUM_ACTIONS,        # 2 actions: shrink, reset
+        n_neurons_per_ensemble  = NEURONS_PER_ENS,       # neurons per action ensemble
+    )
 
     # ================[ UTILITY ENSEMBLE ]================
     # Ensemble to represent the utility of each action
 
     def _sigmoid(z):
         return 1.0 / (1.0 + np.exp(-z))
+
+    def get_proportion(features):
+        smi, cdd, sgd, nrd, rsd = features
+        p = 0.75 - 0.40 * smi + 0.40 * nrd + 0.20 * cdd
+        return np.clip(p, MIN_PROPORTION, 0.99)
 
     def utility_func(t, best_f):
         """Compute utilities for each action based on the current state.
@@ -188,7 +192,7 @@ with model:
 
         # Heuristic utility computations
         w_shrink    = 1.0 * smi + 0.25 * (1.0 - narrowness_deg) + 0.25 * (1.0 - cooldown_deg)
-        w_reset     = (0.5 * stagnation_deg + 0.25 * narrowness_deg + 0.25 * reset_deg) * reset_mask
+        w_reset     = (1.0 * stagnation_deg + 0.25 * narrowness_deg + 0.25 * reset_deg) * reset_mask
 
         # Masked softmax to compute action probabilities
         weights     = np.array([w_shrink, w_reset])
@@ -216,13 +220,14 @@ with model:
 
         if action == "SHRINK":
             # proportion  = np.random.uniform(0.25, 0.5)
-            # proportion  = 0.2
-            smi         = state["curr_features"][0]
-            proportion  = 0.25 + np.random.uniform(0.25, 0.75) * smi
+            proportion  = 0.5
+            # smi         = state["curr_features"][0]
+            # proportion  = 0.25 + np.random.uniform(0.25, 0.75) * smi
+            # proportion  = get_proportion(state["curr_features"])
             # proportion  = float(secrets.SystemRandom().uniform(0.25, 0.75))
 
         elif action == "RESET":
-            proportion  = -1.0 # RESET to global bounds
+            proportion  = 0.0 # RESET to global bounds
         else:
             proportion  = 1.0  # Default to HOLD
 
@@ -245,7 +250,7 @@ with model:
         if state["in_cooldown"]:
             return current_v
 
-        if proportion < 0.0: # RESET action
+        if proportion < MIN_PROPORTION: # RESET action
             state["width_proportion"]   = 1.0
             new_lb, new_ub              = X_LOWER_BOUND0.copy(), X_UPPER_BOUND0.copy()
 
@@ -258,7 +263,7 @@ with model:
             state["t_last_reset"]       = t
             # state["t_stag_start"]       = t
             # state["smoothed_improv"]    = 0.0
-            state["prev_best_f"]        = state["best_f"]
+            state["prev_best_f"]        = 6e9
 
         else:
             proportion  = max(MIN_PROPORTION, min(1.0, proportion))
@@ -390,12 +395,12 @@ with model:
         if state["best_v"] is None:
             return np.zeros_like(x)
 
-        in_cooldown = (t - state["t_last_action"]) < DEFAULT_WAIT
+        eta     = 1.0
+        sigma   = 0.1
+        # eta     = 0.8 if state["in_cooldown"] else 0.2
+        # sigma   = 0.01 if state["in_cooldown"] else 0.08
 
-        eta     = 0.8 if in_cooldown else 0.2
-        sigma   = 0.01 if in_cooldown else 0.08
-
-        return x + eta * (state["best_v"] - x) + np.random.normal(0, sigma, size=NUM_DIMENSIONS)
+        return eta * (state["best_v"] - x) + np.random.normal(0, sigma, size=NUM_DIMENSIONS)
 
     hs_node     = nengo.Node(
         label       = "hs",
@@ -410,7 +415,7 @@ with model:
         if t < 0.01:
             return v0_state.copy()
         if t <= state["retarget_until"] and state["best_v"] is not None:
-            return state["best_v"]
+            return state["best_v"] + np.random.normal(0, 0.01, size=NUM_DIMENSIONS)
         return np.zeros(NUM_DIMENSIONS)
 
     # Pulser node to trigger actions
@@ -444,33 +449,33 @@ with model:
         synapse     = None,
     )
 
-    # # [Utility] --- x --> [Basal ganglia]
-    # nengo.Connection(
-    #     pre         = utility_ens,
-    #     post        = basal_ganglia.input,
-    #     synapse     = 0.01,
-    # )
-    #
-    # # [Basal ganglia] --- action --> [Thalamus]
-    # nengo.Connection(
-    #     pre         = basal_ganglia.output,
-    #     post        = thalamus.input,
-    #     synapse     = 0.01,
-    # )
-    #
-    # # [Thalamus] --- action --> [Premotor]
-    # nengo.Connection(
-    #     pre         = thalamus.output,
-    #     post        = premotor_node,
-    #     synapse     = 0.01,
-    # )
-
-    # [Utility] --- x --> [Premotor]
+    # [Utility] --- x --> [Basal ganglia]
     nengo.Connection(
         pre         = utility_ens,
+        post        = basal_ganglia.input,
+        synapse     = 0.01,
+    )
+
+    # [Basal ganglia] --- action --> [Thalamus]
+    nengo.Connection(
+        pre         = basal_ganglia.output,
+        post        = thalamus.input,
+        synapse     = 0.01,
+    )
+
+    # [Thalamus] --- action --> [Premotor]
+    nengo.Connection(
+        pre         = thalamus.output,
         post        = premotor_node,
         synapse     = 0.01,
     )
+
+    # # [Utility] --- x --> [Premotor]
+    # nengo.Connection(
+    #     pre         = utility_ens,
+    #     post        = premotor_node,
+    #     synapse     = 0.01,
+    # )
 
     # [Premotor] --- proportion --> [Reframing]
     nengo.Connection(
@@ -612,7 +617,7 @@ def add_colors():
 
 action_data = sim.data[utility_vals]
 
-# plt.figure(figsize=(10, 5))
+plt.figure(figsize=(12, 8), dpi=150)
 plt.plot(sim.trange(), action_proportions, color="black", label="Width Prop.")
 
 offsets = [0] * 2 #[-0.5, 0.0, 0.5]
@@ -644,7 +649,7 @@ plt.show()
 
 #%%
 # Plot the decoded output of the ensemble
-plt.figure()
+plt.figure(figsize=(12, 8), dpi=150)
 # plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -5, 5, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
 add_colors()
@@ -656,7 +661,7 @@ plt.show()
 
 #%%
 # Plot the decoded output of the ensemble
-plt.figure()
+plt.figure(figsize=(12, 8), dpi=150)
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -1, 1, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
 add_colors()
 plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
@@ -667,7 +672,7 @@ plt.legend()
 plt.show()
 
 #%%
-plt.figure()
+plt.figure(figsize=(12, 8), dpi=150)
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, 1e0, 1e9, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
 add_colors()
 plt.plot(sim.trange(), sim.data[obj_val] - problem.optimum.y, label="Objective value error")

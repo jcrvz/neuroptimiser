@@ -13,7 +13,7 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 24  # Problem ID from the IOH framework
+PROBLEM_ID      = 10  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
 NEURONS_PER_DIM = 100
@@ -179,65 +179,54 @@ with model:
         # Extract feature vector (order: SMI, CDD, SGD, NRD, RSD)
         smi, cooldown_deg, stagnation_deg, narrowness_deg, reset_deg = state["curr_features"]
 
-        # Mode 2: must RESET
-        if (stagnation_deg >= 1.0 or narrowness_deg >= 1.0) and (reset_deg >= 1.0):
-            return np.array([0.0, 1.0])  # Only RESET
+        # RESET when allowed and either stagnating or too narrow
+        if (reset_deg >= 1.0) and (stagnation_deg >= 1.0 or narrowness_deg >= 1.0):
+            return -0.069
 
-        # Mode 0 and 1: cannot and can RESET
-        reset_mask = 1.0 if (reset_deg >= 1.0) and (stagnation_deg >= 1.0 or narrowness_deg >= 1.0) else 0.0
-
-        # Heuristic utility computations
-        w_shrink = (
-            1.00 * smi +
-            0.25 * (1.0 - narrowness_deg) +
-            0.25 * (1.0 - cooldown_deg)
-        )
-        w_reset = (
-            0.50 * stagnation_deg +
-            0.25 * narrowness_deg +
-            0.25 * cooldown_deg
-        ) * reset_mask
-
-        # Masked softmax to compute action probabilities
-        weights     = np.array([w_shrink, w_reset])
-        weights     -= np.max(weights)
-        exp_vals    = np.exp(weights / SOFTMAX_TEMP)
-        return exp_vals / (np.sum(exp_vals) + EPS)
+        # Otherwise, compute a SHRINK proportion in (0, 1)
+        # Smaller when improving (smi high), larger when narrow/cooldown high.
+        p   = np.clip(
+            0.75
+            - 0.50 * smi
+            + 0.40 * narrowness_deg
+            + 0.20 * cooldown_deg,
+            MIN_PROPORTION, 1.0)
+        return p
 
 
     utility_ens = nengo.Node(
         label       = "utility",
         output      = utility_func,
         size_in     = 1,
-        size_out    = NUM_ACTIONS,
+        size_out    = 1,
     )
 
-    def premotor_func(t, action_vector):
+    def premotor_func(t, proportion):
         """Pre-motor function to modulate the motor ensemble based on the selected action.
         """
-        action_values           = action_vector
-        action_idx              = int(np.argmax(action_values))
-        action                  = ACTIONS[action_idx]
-        state["prev_action"]    = action_idx
-
-        if action == "SHRINK":
-            # proportion  = np.random.uniform(0.25, 0.5)
-            # proportion  = 0.2
-            smi         = state["curr_features"][0]
-            proportion  = 0.25 + np.random.uniform(0.25, 0.75) * smi
-            # proportion  = float(secrets.SystemRandom().uniform(0.25, 0.75))
-
-        elif action == "RESET":
-            proportion  = -1.0 # RESET to global bounds
-        else:
-            proportion  = 1.0  # Default to HOLD
+        # action_values           = action_vector
+        # action_idx              = int(np.argmax(action_values))
+        # action                  = ACTIONS[action_idx]
+        # state["prev_action"]    = action_idx
+        #
+        # if action == "SHRINK":
+        #     # proportion  = np.random.uniform(0.25, 0.5)
+        #     # proportion  = 0.2
+        #     smi         = state["curr_features"][0]
+        #     proportion  = 0.25 + np.random.uniform(0.25, 0.75) * smi
+        #     # proportion  = float(secrets.SystemRandom().uniform(0.25, 0.75))
+        #
+        # elif action == "RESET":
+        #     proportion  = -1.0 # RESET to global bounds
+        # else:
+        #     proportion  = 1.0  # Default to HOLD
 
         return proportion
 
     premotor_node = nengo.Node(
         label       = "premotor",
         output      = premotor_func,
-        size_in     = NUM_ACTIONS,
+        size_in     = 1,
         size_out    = 1,
     )
 
@@ -251,7 +240,7 @@ with model:
         if state["in_cooldown"]:
             return current_v
 
-        if proportion < 0.0: # RESET action
+        if proportion <= 0.0: # RESET action
             state["width_proportion"]   = 1.0
             new_lb, new_ub              = X_LOWER_BOUND0.copy(), X_UPPER_BOUND0.copy()
 
@@ -621,10 +610,10 @@ action_data = sim.data[utility_vals]
 # plt.figure(figsize=(10, 5))
 plt.plot(sim.trange(), action_proportions, color="black", label="Width Prop.")
 
-offsets = [0] * 2 #[-0.5, 0.0, 0.5]
-for i, action_label in enumerate(ACTIONS):
+offsets = [0] * 1 #[-0.5, 0.0, 0.5]
+for i, action_label in enumerate(["Proportion"]):
     plt.plot(sim.trange() + offsets[i], action_data[:, i], '-',
-             label=action_label + " Action", markersize=2)
+             label=action_label, markersize=2)
 plt.xlim(offsets[0], SIMULATION_TIME)
 
 add_colors()
