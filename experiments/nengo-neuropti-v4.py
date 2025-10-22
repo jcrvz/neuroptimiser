@@ -6,19 +6,20 @@ import nengo
 # from collections import deque
 import numpy as np
 from ioh import get_problem
-from nengo.utils.matplotlib import rasterplot
+from nengo.utils.matplotlib import rasterplot, implot
 
 # Transformations
 from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 3  # Problem ID from the IOH framework
+PROBLEM_ID      = 1  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
+
 NEURONS_PER_DIM = 100
 NEURONS_PER_ENS = 20
-SIMULATION_TIME = 10.0  # seconds
+SIMULATION_TIME = 1.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMENSIONS)
 problem.reset()
@@ -47,16 +48,16 @@ NUM_ACTIONS     = len(ACTIONS)
 
 # Exploitation (search-space shrinking) schedule
 SEED_VALUE      = 69
-INIT_WAIT_TIME  = 0.1
-DEFAULT_WAIT    = 0.2       # seconds between action operations
-STAG_WAIT       = 0.5       # seconds of stagnation before a RESET to global bounds
-RESET_COOLDOWN  = 1.0   # seconds between RESET actions
+INIT_WAIT_TIME  = 0.01
+DEFAULT_WAIT    = 0.02       # seconds between action operations
+STAG_WAIT       = 0.05       # seconds of stagnation before a RESET to global bounds
+RESET_COOLDOWN  = 0.05   # seconds between RESET actions
 EPS             = 1e-12     # small value to ensure numerical ordering of bounds
 MIN_WIDTH       = 1e-6      # do not shrink any dimension below this absolute width
 MIN_PROPORTION  = 1e-4      # do not shrink the box below this proportion of the original box
 MIN_IMPROVEMENT = 1e-6      # minimum improvement to consider the optimisation progressing
 ACTION_DELAY    = 0.01      # seconds to retarget the EA to the best_v after a shrink
-ALPHA_IMPROV    = 0.99       # EWMA alpha for improvement smoothing / depends on dt
+ALPHA_IMPROV    = 0.2       # EWMA alpha for improvement smoothing / depends on dt
 
 SOFTMAX_TEMP    = 1.0       # softmax temperature for action selection
 
@@ -75,7 +76,7 @@ with model:
         "ub":               X_UPPER_BOUND.copy(),
         "best_x":           None,                   # best in ORIGINAL space
         "best_v":           v0_state.copy(),        # best in SCALED space
-        "best_f":           None,                   # best objective value
+        "best_f":           np.inf,                   # best objective value
         "smoothed_improv":  0.0,                    # smoothed improvement metric
         "width_proportion": 1.0,                    # current width proportion relative to original box
         "t_last_action":      0.0,                    # time of last shrink / reset
@@ -87,7 +88,7 @@ with model:
         "curr_features":    None,                   # weights: shape (NUM_ACTIONS, NUM_FEATURES)
         "prev_features":    None,                   # previous features: shape (NUM_FEATURES,)
         "prev_action":      None,                   # previous action index executed
-        "prev_best_f":      None,                   # previous best objective value
+        "prev_best_f":      np.inf,                   # previous best objective value
         "in_cooldown":      True,                  # whether in cooldown period after an action
     }
     # rng     =   np.random.default_rng(SEED_VALUE)
@@ -180,15 +181,15 @@ with model:
         smi, cooldown_deg, stagnation_deg, narrowness_deg, reset_deg = state["curr_features"]
 
         # Mode 2: must RESET
-        if (stagnation_deg >= 1.0 or narrowness_deg >= 1.0) and (reset_deg >= 1.0):
-            return np.array([0.0, 1.0])  # Only RESET
+        # if (stagnation_deg >= 1.0 or narrowness_deg >= 1.0) and (reset_deg >= 1.0):
+        #     return np.array([0.0, 1.0])  # Only RESET
 
         # Mode 0 and 1: cannot and can RESET
-        reset_mask = 1.0 if (reset_deg >= 1.0) and (stagnation_deg >= 1.0 or narrowness_deg >= 1.0) else 0.0
+        # reset_mask = 1.0 if (reset_deg >= 1.0) and (stagnation_deg >= 1.0 or narrowness_deg >= 1.0) else 0.0
 
         # Heuristic utility computations
-        w_shrink    = 1.0 * smi + 0.25 * (1.0 - narrowness_deg) + 0.25 * (1.0 - cooldown_deg)
-        w_reset     = (1.0 * stagnation_deg + 0.25 * narrowness_deg + 0.25 * reset_deg) * reset_mask
+        w_shrink    = 2.0 * smi + 1.0 * (1.0 - stagnation_deg) + 0.25 * (1.0 - narrowness_deg) + 0.25 * (1.0 - cooldown_deg)
+        w_reset     = (1.0 * stagnation_deg + 0.25 * narrowness_deg + 0.25 * reset_deg) #* reset_mask
 
         # Masked softmax to compute action probabilities
         weights     = np.array([w_shrink, w_reset])
@@ -223,7 +224,7 @@ with model:
             # proportion  = float(secrets.SystemRandom().uniform(0.25, 0.75))
 
         elif action == "RESET":
-            proportion  = 0.0 # RESET to global bounds
+            proportion  = -0.01 # RESET to global bounds
         else:
             proportion  = 1.0  # Default to HOLD
 
@@ -242,11 +243,19 @@ with model:
         current_v   = input_vector[:-1]
         proportion  = input_vector[-1]
 
+        reset_requested = (proportion < MIN_PROPORTION)
 
-        if state["in_cooldown"]:
+        # RESET allowed immediately (subject to cooldowns)
+        # if reset_requested:
+        if t - state["t_last_action"] < DEFAULT_WAIT:
             return current_v
+        # else:
+        #     if (t < INIT_WAIT_TIME) or ((t - state["t_last_action"]) < DEFAULT_WAIT) or (t < state["retarget_until"]):
+        #         return current_v
+        # if t < INIT_WAIT_TIME or t < state["retarget_until"]:
+        #     return current_v
 
-        if proportion < MIN_PROPORTION: # RESET action
+        if reset_requested: #proportion < MIN_PROPORTION: # RESET action
             state["width_proportion"]   = 1.0
             new_lb, new_ub              = X_LOWER_BOUND0.copy(), X_UPPER_BOUND0.copy()
 
@@ -354,6 +363,7 @@ with model:
         if state["best_f"] is None or (fv < state["best_f"] and t >= 0.01):
             # Register the previous best
             # state["last_best_f"] = state["best_f"]
+            state["prev_best_f"] = state["best_f"]
 
             # Update the best-so-far
             state["best_f"] = fv
@@ -368,9 +378,8 @@ with model:
         state["smoothed_improv"] = (1 - ALPHA_IMPROV) * state["smoothed_improv"] + ALPHA_IMPROV * improvement
 
         # Update stagnation timer
-        if difference > MIN_IMPROVEMENT:
-            state["t_stag_start"] = t
-        state["prev_best_f"] = state["best_f"]
+        # if difference > MIN_IMPROVEMENT:
+        #     state["t_stag_start"] = t
 
         # Update the features
         state["prev_features"] = state["curr_features"]
@@ -685,8 +694,27 @@ plt.show()
 
 #%%
 # Plot the spiking output of the ensemble
-# plt.figure()
-# spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
+# spikes_cat = []
+# for i, p in enumerate(ea_spk):
+#     spikes = sim.data[p]
+#     # indices = sorted_neurons(motor_ens.ensembles[i], sim, iterations=250)
+#     # spikes_cat.append(spikes[:, indices])
+#     spikes_cat.append(spikes)
+# spikes_cat = np.hstack(spikes_cat)
+
+plt.figure(figsize=(12, 8), dpi=150)
+spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
 # rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
+plt.imshow(spikes_cat, aspect="auto", cmap="pink_r", origin="lower",)
+
+t_indices = plt.gca().get_xticks().astype(int)
+t_indices = t_indices[t_indices >= 0.0]
+t_indices[-1] -= 1
+t_labels = [f"{sim.trange()[i]:.1f}" for i in t_indices]
+plt.xticks(t_indices, t_labels)
+
+plt.xlabel("Time, s")
+plt.ylabel("Neuron")
+plt.title("Spikes")
 # plt.xlim(0, SIMULATION_TIME)
-# plt.show()
+plt.show()

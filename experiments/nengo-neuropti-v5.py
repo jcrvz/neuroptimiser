@@ -6,19 +6,20 @@ import nengo
 # from collections import deque
 import numpy as np
 from ioh import get_problem
-from nengo.utils.matplotlib import rasterplot
+from nengo.utils.matplotlib import rasterplot, implot
 
 # Transformations
 from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 10  # Problem ID from the IOH framework
+PROBLEM_ID      = 1  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
+
 NEURONS_PER_DIM = 100
-NEURONS_PER_ENS = 20
-SIMULATION_TIME = 20.0  # seconds
+NEURONS_PER_ENS = 200
+SIMULATION_TIME = 5.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMENSIONS)
 problem.reset()
@@ -47,23 +48,23 @@ NUM_ACTIONS     = len(ACTIONS)
 
 # Exploitation (search-space shrinking) schedule
 SEED_VALUE      = 69
-INIT_WAIT_TIME  = 0.1
-DEFAULT_WAIT    = 0.5       # seconds between action operations
-STAG_WAIT       = 2.0       # seconds of stagnation before a RESET to global bounds
+INIT_WAIT_TIME  = 0.01
+DEFAULT_WAIT    = 0.02       # seconds between action operations
+STAG_WAIT       = 0.5       # seconds of stagnation before a RESET to global bounds
 EPS             = 1e-12     # small value to ensure numerical ordering of bounds
 MIN_WIDTH       = 1e-6      # do not shrink any dimension below this absolute width
 MIN_PROPORTION  = 1e-4      # do not shrink the box below this proportion of the original box
 MIN_IMPROVEMENT = 1e-6      # minimum improvement to consider the optimisation progressing
-ACTION_DELAY    = 0.01      # seconds to retarget the EA to the best_v after a shrink
-ALPHA_IMPROV    = 0.999       # EWMA alpha for improvement smoothing / depends on dt
-# MIN_WIDTH_FRAC   = 0.02    # do not shrink any dimension below 2% of the original rang
+ALPHA_IMPROV    = 0.8       # EWMA alpha for improvement smoothing / depends on dt
+PES_LR_RATE    = 1e-4      # learning rate for the PES rule on the utility ensemble
+TAU            = 0.2       # time constant for integrating centre/spread updates
+CENTRE_LEAK    = 0.03       # leak for centre integrator
+SPREAD_LEAK    = 0.08       # leak for spread integrator
 
-RESET_COOLDOWN  = 2.0   # seconds between RESET actions
+SPREAD_MAX     = 1.5
+SPREAD_MIN     = 0.05
+NUM_FEATURES    = 2
 
-# Q learning parameters
-ALPHA_Q         = 0.1       # learning rate
-GAMMA_Q         = 0.9       # discount factor
-SOFTMAX_TEMP    = 1.0       # softmax temperature for action selection
 
 #%%
 
@@ -81,19 +82,9 @@ with model:
         "best_x":           None,                   # best in ORIGINAL space
         "best_v":           v0_state.copy(),        # best in SCALED space
         "best_f":           None,                   # best objective value
-        "smoothed_improv":  0.0,                    # smoothed improvement metric
-        "width_proportion": 1.0,                    # current width proportion relative to original box
-        "t_last_action":      0.0,                    # time of last shrink / reset
-        "retarget_until":   DEFAULT_WAIT,           # time until which to retarget the EA to best_v
-        "t_last_reset":  0.0,                   # time of last RESET action
+        "smoothed_improv":  1.0,                    # smoothed improvement metric
         "t_stag_start":     0.0,                    # time when stagnation started
-        # "wait_time":        DEFAULT_WAIT,          # seconds between shrink/reset operations
-        # "reset_cooldown":   STAG_WAIT,            # seconds between RESET actions
-        "curr_features":    None,                   # weights: shape (NUM_ACTIONS, NUM_FEATURES)
-        "prev_features":    None,                   # previous features: shape (NUM_FEATURES,)
-        "prev_action":      None,                   # previous action index executed
         "prev_best_f":      None,                   # previous best objective value
-        "in_cooldown":      True,                  # whether in cooldown period after an action
     }
     # rng     =   np.random.default_rng(SEED_VALUE)
 
@@ -132,6 +123,46 @@ with model:
         size_out    = NUM_DIMENSIONS+1,
     )
 
+    # ================[ COMPOSITION ENSEMBLES ]================
+
+    init_c_node = nengo.Node(
+        size_in     = 0,
+        size_out    = NUM_DIMENSIONS,
+        output      = lambda t: v0_state.copy() if t < INIT_WAIT_TIME else np.zeros(NUM_DIMENSIONS),
+    )
+
+    init_s_node = nengo.Node(
+        size_in     = 0,
+        size_out    = NUM_DIMENSIONS,
+        output      = lambda t: np.ones(NUM_DIMENSIONS) if t < INIT_WAIT_TIME else np.zeros(NUM_DIMENSIONS),
+    )
+
+    centre_ens      = nengo.Ensemble(
+        n_neurons   = NEURONS_PER_ENS + 20 * NUM_DIMENSIONS,
+        dimensions  = NUM_DIMENSIONS,
+        radius      = 1.5,
+    )
+
+    spread_ens      = nengo.Ensemble(
+        n_neurons   = NEURONS_PER_ENS + 20 * NUM_DIMENSIONS,
+        dimensions  = NUM_DIMENSIONS,
+        radius      = 1.5,
+    )
+
+    def compose_v(t, data):
+        variable    = data[:NUM_DIMENSIONS]
+        centre      = data[NUM_DIMENSIONS:2*NUM_DIMENSIONS]
+        spread      = np.clip(data[2*NUM_DIMENSIONS:], SPREAD_MIN, SPREAD_MAX)
+
+        return np.clip(centre + variable * spread, -1.0, 1.0)
+
+    compose_node = nengo.Node(
+        label       = "compose_v",
+        size_in     = 3 * NUM_DIMENSIONS,
+        size_out    = NUM_DIMENSIONS,
+        output      = compose_v,
+    )
+
     # ================[ MOTOR ENSEMBLE ]================
     # Ensemble to represent the current candidate solution
 
@@ -144,163 +175,13 @@ with model:
         intercepts      = nengo.dists.Uniform(-0.99, 0.99),
         max_rates   = nengo.dists.Uniform(80,220),
         encoders        = nengo.dists.UniformHypersphere(surface=True),
-        neuron_type     = nengo.LIF(),
+        neuron_type     = nengo.AdaptiveLIF(),
         seed            = SEED_VALUE,
-    )
-
-    # ================[ BASAL GANGLIA AND THALAMUS ]================
-    # Networks to select actions based on utilities
-
-    # basal_ganglia = nengo.networks.BasalGanglia(
-    #     dimensions              = NUM_ACTIONS,        # 2 actions: shrink, reset
-    #     n_neurons_per_ensemble  = NEURONS_PER_ENS,       # neurons per action ensemble
-    # )
-    #
-    # thalamus = nengo.networks.Thalamus(
-    #     dimensions              = NUM_ACTIONS,        # 2 actions: shrink, reset
-    #     n_neurons_per_ensemble  = NEURONS_PER_ENS,       # neurons per action ensemble
-    # )
-
-    # ================[ UTILITY ENSEMBLE ]================
-    # Ensemble to represent the utility of each action
-
-    def _sigmoid(z):
-        return 1.0 / (1.0 + np.exp(-z))
-
-    def utility_func(t, best_f):
-        """Compute utilities for each action based on the current state.
-
-        Internal mode/stage, such as:
-        - Mode 0 (no reset): only can "SHRINK"
-        - Mode 1 (can reset): can "SHRINK" or "RESET"
-        - Mode 2 (should reset): must "RESET"
-
-        """
-        # Extract feature vector (order: SMI, CDD, SGD, NRD, RSD)
-        smi, cooldown_deg, stagnation_deg, narrowness_deg, reset_deg = state["curr_features"]
-
-        # RESET when allowed and either stagnating or too narrow
-        if (reset_deg >= 1.0) and (stagnation_deg >= 1.0 or narrowness_deg >= 1.0):
-            return -0.069
-
-        # Otherwise, compute a SHRINK proportion in (0, 1)
-        # Smaller when improving (smi high), larger when narrow/cooldown high.
-        p   = np.clip(
-            0.75
-            - 0.50 * smi
-            + 0.40 * narrowness_deg
-            + 0.20 * cooldown_deg,
-            MIN_PROPORTION, 1.0)
-        return p
-
-
-    utility_ens = nengo.Node(
-        label       = "utility",
-        output      = utility_func,
-        size_in     = 1,
-        size_out    = 1,
-    )
-
-    def premotor_func(t, proportion):
-        """Pre-motor function to modulate the motor ensemble based on the selected action.
-        """
-        # action_values           = action_vector
-        # action_idx              = int(np.argmax(action_values))
-        # action                  = ACTIONS[action_idx]
-        # state["prev_action"]    = action_idx
-        #
-        # if action == "SHRINK":
-        #     # proportion  = np.random.uniform(0.25, 0.5)
-        #     # proportion  = 0.2
-        #     smi         = state["curr_features"][0]
-        #     proportion  = 0.25 + np.random.uniform(0.25, 0.75) * smi
-        #     # proportion  = float(secrets.SystemRandom().uniform(0.25, 0.75))
-        #
-        # elif action == "RESET":
-        #     proportion  = -1.0 # RESET to global bounds
-        # else:
-        #     proportion  = 1.0  # Default to HOLD
-
-        return proportion
-
-    premotor_node = nengo.Node(
-        label       = "premotor",
-        output      = premotor_func,
-        size_in     = 1,
-        size_out    = 1,
-    )
-
-    # Scheduler function to trigger shrink operations
-    def reframing_func(t, input_vector):
-        # Read the current position and the action proportion
-        current_v   = input_vector[:-1]
-        proportion  = input_vector[-1]
-
-
-        if state["in_cooldown"]:
-            return current_v
-
-        if proportion <= 0.0: # RESET action
-            state["width_proportion"]   = 1.0
-            new_lb, new_ub              = X_LOWER_BOUND0.copy(), X_UPPER_BOUND0.copy()
-
-            # Recompute best_v under the RESET bounds
-            # current_best_x              = np.random.uniform(new_lb, new_ub, NUM_DIMENSIONS)
-            current_best_x              = np.array(state["best_x"])
-            new_best_v                  = tro2s(current_best_x, new_lb, new_ub)
-
-            state["best_x"]             = trs2o(new_best_v, new_lb, new_ub)
-            state["t_last_reset"]       = t
-            # state["t_stag_start"]       = t
-            # state["smoothed_improv"]    = 0.0
-            state["prev_best_f"]        = state["best_f"]
-
-        else:
-            proportion  = max(MIN_PROPORTION, min(1.0, proportion))
-
-            # Current widths and target widths after shrinking
-            half_width  = 0.5 * np.maximum(
-                (state["ub"] - state["lb"]) * proportion,  MIN_WIDTH
-            )
-
-            # Centre the new box around the current best (in original space)
-            centre      = trs2o(state["best_v"], state["lb"], state["ub"])
-
-            # Enforce minimum width and clip to global box
-            new_lb      = np.maximum(centre - half_width, X_LOWER_BOUND0)
-            new_ub      = np.minimum(centre + half_width, X_UPPER_BOUND0)
-
-            # Ensure numerical ordering
-            new_lb      = np.minimum(new_lb, new_ub - EPS)
-            new_ub      = np.maximum(new_ub, new_lb + EPS)
-
-            # Recompute best_v under the NEW bounds so it stays centred on the same best_x
-            new_best_v  = tro2s(state["best_x"], new_lb, new_ub) if state["best_x"] is not None else state["best_v"]
-
-            # Track the current width proportion
-            state["width_proportion"]   = min(1.0, max(MIN_PROPORTION, state["width_proportion"] * proportion))
-
-        state["t_last_action"]        = t
-
-        # Update the local state
-        state["lb"], state["ub"]    = new_lb, new_ub
-        state["best_v"]             = np.clip(new_best_v, -1.0, 1.0)
-        state["retarget_until"]     = t + ACTION_DELAY
-
-        return current_v
-
-    # Scheduler node to trigger shrink operations
-    reframing_node = nengo.Node(
-        label       = "reframing",
-        output      = reframing_func,
-        size_in     = NUM_DIMENSIONS + 1,
-        size_out    = NUM_DIMENSIONS,
     )
 
     def _features_func(t):
         """Extract features from the current state for utility computation.
         """
-
         # Read the current improvement
         # The smoothed improvement (smi) measures how well the optimisation is progressing, in [0, 1], where 1 is best, 0 is worst.
         smi         = np.clip(state["smoothed_improv"], 0.0, 1.0)
@@ -311,29 +192,20 @@ with model:
             (t - state["t_stag_start"]) / STAG_WAIT,
             0.0, 1.0)
 
-        # Cooldown degree
-        # The cooldown degree measures how long since the last action, in [0, 1], where 1 means can act now.
-        cooldown_deg    = np.clip(
-            1.0 - ((t - state["t_last_action"]) / DEFAULT_WAIT),
-            0.0, 1.0)
-
-        # Narrowness degree
-        # The narrowness degree measures how narrow the current search box is, in [0, 1], where 1 means at minimum proportion.
-        width_prop      = state["width_proportion"]
-        narrowness_deg = np.clip((1.0 - width_prop) / (1.0 - MIN_PROPORTION), 0.0, 1.0)
-
-        # Can-reset degree
-        # The can-reset degree measures how long since the last RESET action, in [0, 1], where 1 means can RESET now.
-        reset_deg       = np.clip((t - state["t_last_reset"]) / RESET_COOLDOWN, 0.0, 1.0)
-
-        # Update state in_cooldown flag
-        state["in_cooldown"] = (t - state["t_last_action"]) < DEFAULT_WAIT
-
         # Update the current features
-        return np.array([smi, cooldown_deg, stagnation_deg, narrowness_deg, reset_deg],
+        return  np.array([smi, stagnation_deg],
             dtype=float)
 
-    state["curr_features"] = _features_func(0.0)
+    # state["curr_features"] = _features_func(0.0)
+
+
+    # Features node to extract features for utility computation
+    features_node = nengo.Node(
+        label       = "features",
+        output      = _features_func,
+        size_in     = 0,
+        size_out    = NUM_FEATURES,
+    )
 
     # Selector node to keep track of the best-so-far
     def selector_func(t, x):
@@ -342,11 +214,12 @@ with model:
         v       = x[:NUM_DIMENSIONS]
         fv      = float(x[NUM_DIMENSIONS])
 
-        # Update improvement metrics
-        if state["best_f"] is None or (fv < state["best_f"] and t >= 0.01):
-            # Register the previous best
-            # state["last_best_f"] = state["best_f"]
+        if state["prev_best_f"] is None:
+            state["prev_best_f"] = fv
 
+        # Update improvement metrics
+        if state["best_f"] is None or (fv < state["best_f"] and t >= INIT_WAIT_TIME):
+            # Register the previous best
             # Update the best-so-far
             state["best_f"] = fv
             state["best_v"] = v.copy()
@@ -364,10 +237,6 @@ with model:
             state["t_stag_start"] = t
         state["prev_best_f"] = state["best_f"]
 
-        # Update the features
-        state["prev_features"] = state["curr_features"]
-        state["curr_features"] = _features_func(t)
-
         if state["best_v"] is None:
             return np.concatenate((v, [fv]))
         else:
@@ -380,17 +249,35 @@ with model:
         size_out    = NUM_DIMENSIONS + 1,
     )
 
+
+    # Heads that output desired increments for centre and spread
+    c_update_ens   = nengo.Ensemble(
+        n_neurons   = NEURONS_PER_ENS,
+        dimensions  = NUM_DIMENSIONS,
+    )
+    s_update_ens   = nengo.Ensemble(
+        n_neurons   = NEURONS_PER_ENS,
+        dimensions  = NUM_DIMENSIONS,
+    )
+
+    # Encode features
+    features_ens = nengo.Ensemble(
+        n_neurons   = NEURONS_PER_ENS,
+        dimensions  = NUM_FEATURES,
+    )
+
+
+
+
     # Selector / controller node to move towards the best-so-far
     def hs(t, x):
         if state["best_v"] is None:
             return np.zeros_like(x)
 
-        in_cooldown = (t - state["t_last_action"]) < DEFAULT_WAIT
+        eta     = 1.0
+        sigma   = 0.05
 
-        eta     = 0.8 if in_cooldown else 0.2
-        sigma   = 0.01 if in_cooldown else 0.08
-
-        return x + eta * (state["best_v"] - x) + np.random.normal(0, sigma, size=NUM_DIMENSIONS)
+        return eta * (state["best_v"] - x) + np.random.normal(0, sigma, size=NUM_DIMENSIONS)
 
     hs_node     = nengo.Node(
         label       = "hs",
@@ -402,10 +289,10 @@ with model:
 
     # Pulser function to inject the initial guess at t=0 and best_v after shrinks
     def pulser_func(t):
-        if t < 0.01:
+        if (t < INIT_WAIT_TIME):
             return v0_state.copy()
-        if t <= state["retarget_until"] and state["best_v"] is not None:
-            return state["best_v"]
+        # if t <= state["retarget_until"] and state["best_v"] is not None:
+            # return state["best_v"] + np.random.normal(0, 0.01, size=NUM_DIMENSIONS)
         return np.zeros(NUM_DIMENSIONS)
 
     # Pulser node to trigger actions
@@ -428,6 +315,41 @@ with model:
         output      = lambda t, x: trs2o(x[:NUM_DIMENSIONS], state["lb"], state["ub"])
     )
 
+    # LEARNING RULES (Teaching signals)
+    def _c_teaching_func(t, x):
+        """Centre update teaching signal."""
+        best_v      = x[:NUM_DIMENSIONS]
+        curr_v      = x[NUM_DIMENSIONS:2*NUM_DIMENSIONS]
+        smi, sgd    = x[2*NUM_DIMENSIONS:]
+
+        # Move centre toward best_v, scaled by smi and sgd
+        # centre_val  = sgd * best_v - 10 * (sgd * curr_v)
+        centre_val = (smi + 0.5*sgd) * (best_v - curr_v)
+        return centre_val
+
+    def _s_teaching_func(t, x):
+        """Spread update teaching signal."""
+        smi,sgd     = x
+
+        # Reduce spread when improving, increase when stagnating
+        # spread_val  = 0.02 * (sgd - 0.5 * (1.0 - smi))
+        spread_val  = sgd + (1.0 - sgd) * MIN_WIDTH
+        # spread_val = 0.2 * (sgd - smi)
+        return spread_val * np.ones(NUM_DIMENSIONS)
+
+    c_teaching_node = nengo.Node(
+        label       = "c_teach",
+        size_in     = 2 * NUM_DIMENSIONS + NUM_FEATURES,
+        size_out    = NUM_DIMENSIONS,
+        output      = _c_teaching_func,
+    )
+
+    s_teaching_node = nengo.Node(
+        label       = "s_teach",
+        size_in     = NUM_FEATURES,
+        size_out    = NUM_DIMENSIONS,
+        output      = _s_teaching_func,
+    )
 
     # CONNECTIONS
     # --------------------------------------------------------------
@@ -439,41 +361,6 @@ with model:
         synapse     = None,
     )
 
-    # # [Utility] --- x --> [Basal ganglia]
-    # nengo.Connection(
-    #     pre         = utility_ens,
-    #     post        = basal_ganglia.input,
-    #     synapse     = 0.01,
-    # )
-    #
-    # # [Basal ganglia] --- action --> [Thalamus]
-    # nengo.Connection(
-    #     pre         = basal_ganglia.output,
-    #     post        = thalamus.input,
-    #     synapse     = 0.01,
-    # )
-    #
-    # # [Thalamus] --- action --> [Premotor]
-    # nengo.Connection(
-    #     pre         = thalamus.output,
-    #     post        = premotor_node,
-    #     synapse     = 0.01,
-    # )
-
-    # [Utility] --- x --> [Premotor]
-    nengo.Connection(
-        pre         = utility_ens,
-        post        = premotor_node,
-        synapse     = 0.01,
-    )
-
-    # [Premotor] --- proportion --> [Reframing]
-    nengo.Connection(
-        pre         = premotor_node,
-        post        = reframing_node[-1],
-        synapse     = 0.01,
-    )
-
     # [EA output] --- x --> [Selector]
     nengo.Connection(
         pre         = motor_ens.output,
@@ -482,26 +369,35 @@ with model:
     )
 
     # [Selector] --- x (delayed) --> [EA input]
-    tau = 0.1
     nengo.Connection(
         pre         = hs_node,
         post        = motor_ens.input,
-        synapse     = tau,
+        synapse     = TAU,
         transform   = np.eye(NUM_DIMENSIONS),
     )
 
-    # [EA output] --- x --> [Objective function]
+    # [EA output] + [Centre] + [Spread] --> [Compose v]
     nengo.Connection(
         pre         = motor_ens.output,
-        post        = reframing_node[:-1],
+        post        = compose_node[:NUM_DIMENSIONS],
         synapse     = 0,
     )
-
-    # [Reframing] -> [Objective function]
     nengo.Connection(
-        pre        = reframing_node,
-        post       = obj_node,
-        synapse    = 0,
+        pre         = centre_ens,
+        post        = compose_node[NUM_DIMENSIONS:2*NUM_DIMENSIONS],
+        synapse     = 0.02,
+    )
+    nengo.Connection(
+        pre         = spread_ens,
+        post        = compose_node[2*NUM_DIMENSIONS:],
+        synapse     = 0.02,
+    )
+
+    # [Compose v] --- v --> [Objective function]
+    nengo.Connection(
+        pre         = compose_node,
+        post        = obj_node,
+        synapse     = 0,
     )
 
     # [Objective function] --- (x,f) --> [Selector]
@@ -511,11 +407,64 @@ with model:
         synapse     = 0,
     )
 
-    # [Selector] --- (fbest) ---> [Utility]
+    # [Features] --- features --> [Features ensemble]
     nengo.Connection(
-        pre         = selector_node[-1],
-        post        = utility_ens,
-        synapse     = 0,
+        pre         = features_node,
+        post        = features_ens,
+        synapse     = None,
+    )
+
+    # Learn feature from updates with PES rule
+    c_connect = nengo.Connection(
+        pre                 = features_ens,
+        post                = c_update_ens,
+        function            = lambda x: np.zeros(NUM_DIMENSIONS),
+        learning_rule_type  = nengo.PES(learning_rate=PES_LR_RATE),
+    )
+    s_connect = nengo.Connection(
+        pre                 = features_ens,
+        post                = s_update_ens,
+        function            = lambda x: np.zeros(NUM_DIMENSIONS),
+        learning_rule_type  = nengo.PES(learning_rate=PES_LR_RATE),
+    )
+
+    # Integrate updates into centre and spread ensembles
+
+    nengo.Connection(
+        pre         = init_c_node,
+        post        = centre_ens,
+        synapse     = TAU,
+    )
+
+    nengo.Connection(
+        pre         = init_s_node,
+        post        = spread_ens,
+        synapse     = TAU,
+    )
+
+    nengo.Connection(
+        pre         = c_update_ens,
+        post        = centre_ens,
+        synapse     = TAU,
+    )
+    nengo.Connection(
+        pre         = s_update_ens,
+        post        = spread_ens,
+        synapse     = TAU,
+    )
+
+    # Make centre/spread "stateful" via an NEF integrator: τ dx/dt = u
+    nengo.Connection(
+        pre         = centre_ens,
+        post        = centre_ens,
+        synapse     = TAU,
+        transform   = (1.0 - CENTRE_LEAK) * np.eye(NUM_DIMENSIONS),
+    )
+    nengo.Connection(
+        pre         = spread_ens,
+        post        = spread_ens,
+        synapse     = TAU,
+        transform   = (1.0 - SPREAD_LEAK) * np.eye(NUM_DIMENSIONS),
     )
 
     # [Selector] --- fbest --> [fbest_only]
@@ -533,28 +482,54 @@ with model:
         synapse     = 0,
     )
 
-    def _proportion_func(t):
-        # if t < state["retarget_until"]:
-        return state["width_proportion"]
-        # return 1.0
+    # [Motor, Selector, Features] --> [c_teaching, s_teaching]
+    nengo.Connection(
+        pre         = selector_node[:NUM_DIMENSIONS],
+        post        = c_teaching_node[:NUM_DIMENSIONS],
+        synapse     = 0,
+    )
+    nengo.Connection(
+        pre         = motor_ens.output,
+        post        = c_teaching_node[NUM_DIMENSIONS:2*NUM_DIMENSIONS],
+        synapse     = 0.01, # delay to allow selector to update first, how much? 0.01 ?
+    )
+    nengo.Connection(
+        pre         = features_node,
+        post        = c_teaching_node[2*NUM_DIMENSIONS:],
+        synapse     = 0.01,
+    )
 
-    _proportion_node = nengo.Node(
-        label       = "proportion",
-        size_in     = 0,
-        size_out    = 1,
-        output      = _proportion_func,
+    nengo.Connection(
+        pre         = features_node,
+        post        = s_teaching_node,
+        synapse     = 0,
+    )
+
+    nengo.Connection(
+        pre         = c_teaching_node,
+        post        = c_connect.learning_rule,
+        synapse     = TAU,
+    )
+    nengo.Connection(
+        pre         = s_teaching_node,
+        post        = s_connect.learning_rule,
+        synapse     = TAU,
     )
 
     # PROBES
     # --------------------------------------------------------------
-    shrink_trigger  = nengo.Probe(_proportion_node, synapse=None)
+    # shrink_trigger  = nengo.Probe(_proportion_node, synapse=None)
     ens_lif_val     = nengo.Probe(motor_ens.output, synapse=0.01)  # 10ms filter
     obj_val         = nengo.Probe(obj_node[-1], synapse=0)
     fbest_val       = nengo.Probe(fbest_only, synapse=0.01)
     xbest_val       = nengo.Probe(xbest_only, synapse=0.01)
     ea_spk          = [nengo.Probe(ens.neurons, synapse=0.01) for ens in motor_ens.ensembles]
 
-    utility_vals    = nengo.Probe(utility_ens, synapse=0.01)
+    centre_val      = nengo.Probe(c_teaching_node, synapse=0.01)
+    spread_val      = nengo.Probe(s_teaching_node, synapse=0.01)
+    features_val    = nengo.Probe(features_node, synapse=0.01)
+
+    # utility_vals    = nengo.Probe(utility_ens, synapse=0.01)
 
 #%%
 # Create our simulator
@@ -579,57 +554,12 @@ x = sim.data[xbest_val][-1]
 f = problem(x)
 print(f"f(xbest): {f:.4f} (opt: {problem.optimum.y}), diff: {f - problem.optimum.y:.4f}")
 
-#%% Process actions
-action_proportions = sim.data[shrink_trigger].astype(float).flatten()
-action_times = np.arange(len(action_proportions)) * sim.dt
-
-change_proportions = np.diff(action_proportions)
-change_indices = np.where(change_proportions != 0)[0]
-
-def add_colors():
-    # Indices where the action proportion changes
-    for idx in change_indices:
-        delta = change_proportions[idx]
-        t = action_times[idx + 1]
-        if delta < 0:
-            color   = "red"
-            marker  = "v"
-        elif delta == 0:
-            color   = "black"
-            marker  = "o"
-        else:
-            color   = "blue"
-            marker  = "^"
-        plt.axvline(t, color=color, alpha=0.3, linestyle="--", marker=marker)
-
-#%% Plot the action proportions over time
-
-
-action_data = sim.data[utility_vals]
-
-# plt.figure(figsize=(10, 5))
-plt.plot(sim.trange(), action_proportions, color="black", label="Width Prop.")
-
-offsets = [0] * 1 #[-0.5, 0.0, 0.5]
-for i, action_label in enumerate(["Proportion"]):
-    plt.plot(sim.trange() + offsets[i], action_data[:, i], '-',
-             label=action_label, markersize=2)
-plt.xlim(offsets[0], SIMULATION_TIME)
-
-add_colors()
-plt.axhline(MIN_PROPORTION, color="cyan", linestyle="--")
-
-plt.legend(loc="upper center", bbox_to_anchor=(0.5, 1.10), ncol=3)
-plt.ylabel("Utility / Value")
-plt.xlabel("Time, s")
-plt.show()
-
 
 #%%
 # plt.figure()
 # # plt.plot(sim.trange(), sim.data[obj_val] - problem.optimum.y, label="Objective value")
 # # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, 1e0, 1e10, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
-# add_colors()
+#
 # plt.plot(sim.trange(), sim.data[fbest_val] - problem.optimum.y, label="Best-so-far diff") #"Best-so-far value")
 # plt.xlim(0, SIMULATION_TIME)
 # plt.yscale("log")
@@ -639,10 +569,9 @@ plt.show()
 
 #%%
 # Plot the decoded output of the ensemble
-plt.figure()
+plt.figure(figsize=(12, 8), dpi=150)
 # plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -5, 5, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
-add_colors()
 plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
 # plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
 plt.xlim(0, SIMULATION_TIME)
@@ -651,9 +580,8 @@ plt.show()
 
 #%%
 # Plot the decoded output of the ensemble
-plt.figure()
+plt.figure(figsize=(12, 8), dpi=150)
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -1, 1, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
-add_colors()
 plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
 # plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
 # plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
@@ -662,23 +590,56 @@ plt.legend()
 plt.show()
 
 #%%
-plt.figure()
+plt.figure(figsize=(12, 8), dpi=150)
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, 1e0, 1e9, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
-add_colors()
 plt.plot(sim.trange(), sim.data[obj_val] - problem.optimum.y, label="Objective value error")
 plt.plot(sim.trange(), sim.data[fbest_val] - problem.optimum.y, label="Best-so-far error")
 # plt.hlines(problem.optimum.y, 0, simulation_time, colors="r", linestyles="dashed", label="Optimal value")
 # plt.plot(sim.trange(), sim.data[fbest_val] - problem.optimum.y, label="Best-so-far diff") #"Best-so-far value")
+
+# add second axis for centre and spread
+ax1 = plt.gca()
 plt.xlim(0, SIMULATION_TIME)
+plt.xlabel("Time, s")
+plt.ylabel("Objective value error")
 plt.yscale("log")
 plt.legend()
+
+ax2 = ax1.twinx()
+ax2.plot(sim.trange(), np.average(sim.data[centre_val], axis=1), "g--", label="Centre")
+ax2.plot(sim.trange(), np.average(sim.data[spread_val], axis=1), "m--", label="Spread")
+ax2.plot(sim.trange(), sim.data[features_val][:,0], "c:", label="SMI")
+ax2.plot(sim.trange(), sim.data[features_val][:,1], "y:", label="SGD")
+ax2.set_ylabel("Centre / Spread values")
+ax2.set_yscale("linear")
+ax2.legend(loc="upper right")
+
 plt.title(f"Obj. func. err. vs time | fbest: {sim.data[fbest_val][-1][0]:.2f} :: fopt: {problem.optimum.y}")
 plt.show()
 
 #%%
 # Plot the spiking output of the ensemble
-# plt.figure()
-# spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
+# spikes_cat = []
+# for i, p in enumerate(ea_spk):
+#     spikes = sim.data[p]
+#     # indices = sorted_neurons(motor_ens.ensembles[i], sim, iterations=250)
+#     # spikes_cat.append(spikes[:, indices])
+#     spikes_cat.append(spikes)
+# spikes_cat = np.hstack(spikes_cat)
+
+plt.figure(figsize=(12, 8), dpi=150)
+spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
 # rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
+plt.imshow(spikes_cat, aspect="auto", cmap="pink_r", origin="lower",)
+
+t_indices = plt.gca().get_xticks().astype(int)
+t_indices = t_indices[t_indices >= 0.0]
+t_indices[-1] -= 1
+t_labels = [f"{sim.trange()[i]:.1f}" for i in t_indices]
+plt.xticks(t_indices, t_labels)
+
+plt.xlabel("Time, s")
+plt.ylabel("Neuron")
+plt.title("Spikes")
 # plt.xlim(0, SIMULATION_TIME)
-# plt.show()
+plt.show()
