@@ -3,7 +3,7 @@ import secrets
 
 import matplotlib.pyplot as plt
 import nengo
-# from collections import deque
+from collections import deque
 import numpy as np
 from ioh import get_problem
 from nengo.utils.matplotlib import rasterplot, implot
@@ -13,13 +13,13 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 1  # Problem ID from the IOH framework
+PROBLEM_ID      = 4  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
 
 NEURONS_PER_DIM = 100
 NEURONS_PER_ENS = 200
-SIMULATION_TIME = 5.0  # seconds
+SIMULATION_TIME = 10.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMENSIONS)
 problem.reset()
@@ -56,13 +56,13 @@ MIN_WIDTH       = 1e-6      # do not shrink any dimension below this absolute wi
 MIN_PROPORTION  = 1e-4      # do not shrink the box below this proportion of the original box
 MIN_IMPROVEMENT = 1e-6      # minimum improvement to consider the optimisation progressing
 ALPHA_IMPROV    = 0.8       # EWMA alpha for improvement smoothing / depends on dt
-PES_LR_RATE    = 1e-4      # learning rate for the PES rule on the utility ensemble
-TAU            = 0.2       # time constant for integrating centre/spread updates
+TAU_1           = 0.01       # time constant
+TAU_2           = 0.1        # time constant
 CENTRE_LEAK    = 0.03       # leak for centre integrator
 SPREAD_LEAK    = 0.08       # leak for spread integrator
 
-SPREAD_MAX     = 1.5
-SPREAD_MIN     = 0.05
+SPREAD_MAX     = 1.0
+SPREAD_MIN     = 1e-12
 NUM_FEATURES    = 2
 
 
@@ -85,6 +85,9 @@ with model:
         "smoothed_improv":  1.0,                    # smoothed improvement metric
         "t_stag_start":     0.0,                    # time when stagnation started
         "prev_best_f":      None,                   # previous best objective value
+        "curr_features":    np.array([0.0, 1.0]),   # current features vector
+        "archive":          deque(maxlen=64),       # small archive of best solutions
+        "stag_pulse":       False,                  # flag for stagnation pulse
     }
     # rng     =   np.random.default_rng(SEED_VALUE)
 
@@ -125,34 +128,10 @@ with model:
 
     # ================[ COMPOSITION ENSEMBLES ]================
 
-    init_c_node = nengo.Node(
-        size_in     = 0,
-        size_out    = NUM_DIMENSIONS,
-        output      = lambda t: v0_state.copy() if t < INIT_WAIT_TIME else np.zeros(NUM_DIMENSIONS),
-    )
-
-    init_s_node = nengo.Node(
-        size_in     = 0,
-        size_out    = NUM_DIMENSIONS,
-        output      = lambda t: np.ones(NUM_DIMENSIONS) if t < INIT_WAIT_TIME else np.zeros(NUM_DIMENSIONS),
-    )
-
-    centre_ens      = nengo.Ensemble(
-        n_neurons   = NEURONS_PER_ENS + 20 * NUM_DIMENSIONS,
-        dimensions  = NUM_DIMENSIONS,
-        radius      = 1.5,
-    )
-
-    spread_ens      = nengo.Ensemble(
-        n_neurons   = NEURONS_PER_ENS + 20 * NUM_DIMENSIONS,
-        dimensions  = NUM_DIMENSIONS,
-        radius      = 1.5,
-    )
-
     def compose_v(t, data):
         variable    = data[:NUM_DIMENSIONS]
         centre      = data[NUM_DIMENSIONS:2*NUM_DIMENSIONS]
-        spread      = np.clip(data[2*NUM_DIMENSIONS:], SPREAD_MIN, SPREAD_MAX)
+        spread      = np.clip(data[2*NUM_DIMENSIONS:], MIN_WIDTH, SPREAD_MAX)
 
         return np.clip(centre + variable * spread, -1.0, 1.0)
 
@@ -173,9 +152,9 @@ with model:
         ens_dimensions  = 1,
         radius          = 1.0,
         intercepts      = nengo.dists.Uniform(-0.99, 0.99),
-        max_rates   = nengo.dists.Uniform(80,220),
+        # max_rates   = nengo.dists.Uniform(80,220),
         encoders        = nengo.dists.UniformHypersphere(surface=True),
-        neuron_type     = nengo.AdaptiveLIF(),
+        neuron_type     = nengo.LIF(),
         seed            = SEED_VALUE,
     )
 
@@ -183,8 +162,20 @@ with model:
         """Extract features from the current state for utility computation.
         """
         # Read the current improvement
+        if state["curr_features"][1] >= 1.0:
+            scale                   = max(1.0, abs(state["best_f"]))
+            state["prev_best_f"]    = 1e6 * scale
+
+        # Improvement since last step (minimisation)
+        difference  = max(0.0, state["prev_best_f"] - state["best_f"])
+        denominator = EPS + abs(state["prev_best_f"])
+        improvement = difference / denominator
+        state["smoothed_improv"] = np.clip(
+            ALPHA_IMPROV * state["smoothed_improv"] + (1 - ALPHA_IMPROV) * improvement,
+            0.0, 1.0).astype(float)
+
         # The smoothed improvement (smi) measures how well the optimisation is progressing, in [0, 1], where 1 is best, 0 is worst.
-        smi         = np.clip(state["smoothed_improv"], 0.0, 1.0)
+        smi             = state["smoothed_improv"]
 
         # Stagnation degree
         # The stagnation degree measures how long since the last improvement, in [0, 1], where 1 means ready to RESET.
@@ -193,8 +184,8 @@ with model:
             0.0, 1.0)
 
         # Update the current features
-        return  np.array([smi, stagnation_deg],
-            dtype=float)
+        state["curr_features"]  = np.array([smi, stagnation_deg], dtype=float)
+        return state["curr_features"]
 
     # state["curr_features"] = _features_func(0.0)
 
@@ -214,28 +205,24 @@ with model:
         v       = x[:NUM_DIMENSIONS]
         fv      = float(x[NUM_DIMENSIONS])
 
-        if state["prev_best_f"] is None:
-            state["prev_best_f"] = fv
+        # if state["prev_best_f"] is None:
+        #     state["prev_best_f"] = fv
 
         # Update improvement metrics
         if state["best_f"] is None or (fv < state["best_f"] and t >= INIT_WAIT_TIME):
             # Register the previous best
+            state["prev_best_f"] = state["best_f"]
+
             # Update the best-so-far
             state["best_f"] = fv
             state["best_v"] = v.copy()
             # store best in ORIGINAL space under current dynamic bounds
             state["best_x"] = trs2o(state["best_v"], state["lb"], state["ub"])
 
-        # Improvement since last step (minimisation)
-        difference = max(0.0, state["prev_best_f"] - state["best_f"])
-        denominator = EPS + abs(state["prev_best_f"])
-        improvement = difference / denominator
-        state["smoothed_improv"] = (1 - ALPHA_IMPROV) * state["smoothed_improv"] + ALPHA_IMPROV * improvement
-
-        # Update stagnation timer
-        if difference > MIN_IMPROVEMENT:
-            state["t_stag_start"] = t
-        state["prev_best_f"] = state["best_f"]
+            # Add to small archive
+            state["archive"].append((state["best_v"], state["best_f"]))
+            state["t_stag_start"]   = t
+            state["stag_pulse"]     = False
 
         if state["best_v"] is None:
             return np.concatenate((v, [fv]))
@@ -250,32 +237,23 @@ with model:
     )
 
 
-    # Heads that output desired increments for centre and spread
-    c_update_ens   = nengo.Ensemble(
-        n_neurons   = NEURONS_PER_ENS,
-        dimensions  = NUM_DIMENSIONS,
-    )
-    s_update_ens   = nengo.Ensemble(
-        n_neurons   = NEURONS_PER_ENS,
-        dimensions  = NUM_DIMENSIONS,
-    )
-
-    # Encode features
-    features_ens = nengo.Ensemble(
-        n_neurons   = NEURONS_PER_ENS,
-        dimensions  = NUM_FEATURES,
-    )
-
-
-
-
     # Selector / controller node to move towards the best-so-far
     def hs(t, x):
         if state["best_v"] is None:
             return np.zeros_like(x)
 
-        eta     = 1.0
-        sigma   = 0.05
+        smi, sgd    = state["curr_features"]
+        eta         = 1.0 - sgd
+        sigma       = 0.05 + 0.45 * sgd
+
+        # # OPTION 2: Heavy-tail only when stagnated
+        # # Optional heavy tail during full stagnation using existing RNG
+        # if sgd >= 1.0:
+        #     # Replace Gaussian with a crude heavy-tail using a Student-t approximation
+        #     z = np.random.normal(0, 1, size=NUM_DIMENSIONS)
+        #     u = np.random.normal(0, 1, size=NUM_DIMENSIONS)
+        #     heavy = z / np.sqrt((u * u) / 3.0 + 1e-9)  # ~ t with ν≈3, no new knob
+        #     return np.zeros_like(x) + 0.5 * heavy  # no attraction while sgd==1
 
         return eta * (state["best_v"] - x) + np.random.normal(0, sigma, size=NUM_DIMENSIONS)
 
@@ -286,13 +264,60 @@ with model:
         output      = hs
     )
 
+    def _archive_centroid_scaled():
+        if not state["archive"]:
+            return np.zeros(NUM_DIMENSIONS)
+
+        vb, fvb     = zip(*state["archive"])
+        vb          = np.array(vb)
+        fvb         = np.array(fvb, dtype=float)
+
+        # Rank by fitness (lower is better). weights = 1 / rank
+        orders          = np.argsort(fvb)
+        ranks           = np.empty_like(orders)
+        ranks[orders]   = np.arange(1, len(fvb) + 1)
+        weights         = 1.0 / ranks
+        weights         /= weights.sum()
+        centroid        = (weights[:, None] * vb).sum(axis=0)
+        # centroid    = np.sum(vb * weights, axis=0)
+        return centroid
 
     # Pulser function to inject the initial guess at t=0 and best_v after shrinks
     def pulser_func(t):
-        if (t < INIT_WAIT_TIME):
+        if t < INIT_WAIT_TIME:
             return v0_state.copy()
-        # if t <= state["retarget_until"] and state["best_v"] is not None:
-            # return state["best_v"] + np.random.normal(0, 0.01, size=NUM_DIMENSIONS)
+        # if t - state["t_stag_start"] >= 2 * STAG_WAIT:
+        #     sigma       = sgd * 0.5
+        #     return state["best_v"] + np.random.normal(0, sigma, size=NUM_DIMENSIONS)
+
+        smi, sgd    = state["curr_features"]
+        # Option 1:
+        if (sgd >= 1.0): # and (not state["stag_pulse"]):
+            # state["stag_pulse"] = True
+            # zero centre to sample around 0, or archive centroid for informed restart
+            v_seed      = _archive_centroid_scaled() if state["archive"] else np.zeros(NUM_DIMENSIONS)
+            jitter      = np.random.normal(0.0, 0.05, NUM_DIMENSIONS)
+            return np.clip(v_seed + jitter, -1.0, 1.0)
+
+        # Option 3: Partial re-sampling of dimensions during stagnation
+        # if sgd >= 1.0 and np.random.rand() < 0.5:
+        #     # Base seed: zero centre or archive centroid if you already have it
+        #     v_seed = np.zeros(NUM_DIMENSIONS)
+        #     # If you kept the small archive helper, uncomment:
+        #     # v_seed = _archive_centroid_scaled() if state["archive"] else v_seed
+        #
+        #     # Rotate a simple dimension mask with no new knobs
+        #     # Bout 1: even dims; Bout 2: odd dims; then repeat
+        #     mask = np.zeros(NUM_DIMENSIONS, dtype=bool)
+        #     mask[np.random.choice(NUM_DIMENSIONS, size=NUM_DIMENSIONS//2, replace=False)] = True
+        #
+        #     # Sample only masked dims globally in scaled space; keep others
+        #     new_vals = np.random.uniform(-1.0, 1.0, size=NUM_DIMENSIONS)
+        #     v_curr = state["best_v"] if state["best_v"] is not None else v_seed
+        #     v_next = np.where(mask, new_vals, v_curr)
+        #
+        #     return np.clip(v_next, -1.0, 1.0)
+
         return np.zeros(NUM_DIMENSIONS)
 
     # Pulser node to trigger actions
@@ -322,9 +347,10 @@ with model:
         curr_v      = x[NUM_DIMENSIONS:2*NUM_DIMENSIONS]
         smi, sgd    = x[2*NUM_DIMENSIONS:]
 
+        # Determine
+
         # Move centre toward best_v, scaled by smi and sgd
-        # centre_val  = sgd * best_v - 10 * (sgd * curr_v)
-        centre_val = (smi + 0.5*sgd) * (best_v - curr_v)
+        centre_val = (1.0 - sgd ** 1.5) * best_v #(0.8 * best_v + 0.2 * curr_v)
         return centre_val
 
     def _s_teaching_func(t, x):
@@ -332,20 +358,18 @@ with model:
         smi,sgd     = x
 
         # Reduce spread when improving, increase when stagnating
-        # spread_val  = 0.02 * (sgd - 0.5 * (1.0 - smi))
-        spread_val  = sgd + (1.0 - sgd) * MIN_WIDTH
-        # spread_val = 0.2 * (sgd - smi)
+        spread_val  = SPREAD_MIN + (1.0 - SPREAD_MIN) * np.tanh(sgd * 2.0)
         return spread_val * np.ones(NUM_DIMENSIONS)
 
     c_teaching_node = nengo.Node(
-        label       = "c_teach",
+        label       = "centre_control",
         size_in     = 2 * NUM_DIMENSIONS + NUM_FEATURES,
         size_out    = NUM_DIMENSIONS,
         output      = _c_teaching_func,
     )
 
     s_teaching_node = nengo.Node(
-        label       = "s_teach",
+        label       = "spread_control",
         size_in     = NUM_FEATURES,
         size_out    = NUM_DIMENSIONS,
         output      = _s_teaching_func,
@@ -372,7 +396,7 @@ with model:
     nengo.Connection(
         pre         = hs_node,
         post        = motor_ens.input,
-        synapse     = TAU,
+        synapse     = TAU_1,
         transform   = np.eye(NUM_DIMENSIONS),
     )
 
@@ -383,14 +407,14 @@ with model:
         synapse     = 0,
     )
     nengo.Connection(
-        pre         = centre_ens,
+        pre         = c_teaching_node,
         post        = compose_node[NUM_DIMENSIONS:2*NUM_DIMENSIONS],
-        synapse     = 0.02,
+        synapse     = TAU_2,
     )
     nengo.Connection(
-        pre         = spread_ens,
+        pre         = s_teaching_node,
         post        = compose_node[2*NUM_DIMENSIONS:],
-        synapse     = 0.02,
+        synapse     = TAU_2,
     )
 
     # [Compose v] --- v --> [Objective function]
@@ -405,66 +429,6 @@ with model:
         pre         = obj_node,
         post        = selector_node,
         synapse     = 0,
-    )
-
-    # [Features] --- features --> [Features ensemble]
-    nengo.Connection(
-        pre         = features_node,
-        post        = features_ens,
-        synapse     = None,
-    )
-
-    # Learn feature from updates with PES rule
-    c_connect = nengo.Connection(
-        pre                 = features_ens,
-        post                = c_update_ens,
-        function            = lambda x: np.zeros(NUM_DIMENSIONS),
-        learning_rule_type  = nengo.PES(learning_rate=PES_LR_RATE),
-    )
-    s_connect = nengo.Connection(
-        pre                 = features_ens,
-        post                = s_update_ens,
-        function            = lambda x: np.zeros(NUM_DIMENSIONS),
-        learning_rule_type  = nengo.PES(learning_rate=PES_LR_RATE),
-    )
-
-    # Integrate updates into centre and spread ensembles
-
-    nengo.Connection(
-        pre         = init_c_node,
-        post        = centre_ens,
-        synapse     = TAU,
-    )
-
-    nengo.Connection(
-        pre         = init_s_node,
-        post        = spread_ens,
-        synapse     = TAU,
-    )
-
-    nengo.Connection(
-        pre         = c_update_ens,
-        post        = centre_ens,
-        synapse     = TAU,
-    )
-    nengo.Connection(
-        pre         = s_update_ens,
-        post        = spread_ens,
-        synapse     = TAU,
-    )
-
-    # Make centre/spread "stateful" via an NEF integrator: τ dx/dt = u
-    nengo.Connection(
-        pre         = centre_ens,
-        post        = centre_ens,
-        synapse     = TAU,
-        transform   = (1.0 - CENTRE_LEAK) * np.eye(NUM_DIMENSIONS),
-    )
-    nengo.Connection(
-        pre         = spread_ens,
-        post        = spread_ens,
-        synapse     = TAU,
-        transform   = (1.0 - SPREAD_LEAK) * np.eye(NUM_DIMENSIONS),
     )
 
     # [Selector] --- fbest --> [fbest_only]
@@ -486,34 +450,23 @@ with model:
     nengo.Connection(
         pre         = selector_node[:NUM_DIMENSIONS],
         post        = c_teaching_node[:NUM_DIMENSIONS],
-        synapse     = 0,
+        synapse     = TAU_1,
     )
     nengo.Connection(
         pre         = motor_ens.output,
         post        = c_teaching_node[NUM_DIMENSIONS:2*NUM_DIMENSIONS],
-        synapse     = 0.01, # delay to allow selector to update first, how much? 0.01 ?
+        synapse     = TAU_1, # delay to allow selector to update first, how much? 0.01 ?
     )
     nengo.Connection(
         pre         = features_node,
         post        = c_teaching_node[2*NUM_DIMENSIONS:],
-        synapse     = 0.01,
+        synapse     = TAU_1,
     )
 
     nengo.Connection(
         pre         = features_node,
         post        = s_teaching_node,
-        synapse     = 0,
-    )
-
-    nengo.Connection(
-        pre         = c_teaching_node,
-        post        = c_connect.learning_rule,
-        synapse     = TAU,
-    )
-    nengo.Connection(
-        pre         = s_teaching_node,
-        post        = s_connect.learning_rule,
-        synapse     = TAU,
+        synapse     = TAU_1,
     )
 
     # PROBES
@@ -630,7 +583,7 @@ plt.show()
 plt.figure(figsize=(12, 8), dpi=150)
 spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
 # rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
-plt.imshow(spikes_cat, aspect="auto", cmap="pink_r", origin="lower",)
+plt.imshow(spikes_cat.T, aspect="auto", cmap="pink_r", origin="lower",)
 
 t_indices = plt.gca().get_xticks().astype(int)
 t_indices = t_indices[t_indices >= 0.0]
