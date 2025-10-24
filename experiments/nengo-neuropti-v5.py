@@ -13,13 +13,13 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 3  # Problem ID from the IOH framework
+PROBLEM_ID      = 10  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
 
 NEURONS_PER_DIM = 100
 NEURONS_PER_ENS = 200
-SIMULATION_TIME = 100.0  # seconds
+SIMULATION_TIME = 50.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMENSIONS)
 problem.reset()
@@ -54,15 +54,15 @@ STAG_WAIT       = 0.2       #max(0.01, 0.1 * SIMULATION_TIME)       # seconds of
 EPS             = 1e-12     # small value to ensure numerical ordering of bounds
 MIN_WIDTH       = 1e-6      # do not shrink any dimension below this absolute width
 MIN_PROPORTION  = 1e-4      # do not shrink the box below this proportion of the original box
-MIN_IMPROVEMENT = 1e-6      # minimum improvement to consider the optimisation progressing
+MIN_IMPROVEMENT = 0.5      # minimum improvement to consider the optimisation progressing
 ALPHA_IMPROV    = 0.8       # EWMA alpha for improvement smoothing / depends on dt
 TAU_1           = 0.01       # time constant
-TAU_2           = 0.03        # time constant
-CENTRE_LEAK    = 0.03       # leak for centre integrator
+TAU_2           = 0.01        # time constant
+CENTRE_LEAK    = 0.05       # leak for centre integrator
 SPREAD_LEAK    = 0.08       # leak for spread integrator
 
 SPREAD_MAX     = 1.0
-SPREAD_MIN     = 1e-6
+SPREAD_MIN     = 1e-3
 NUM_FEATURES    = 2
 
 
@@ -133,7 +133,19 @@ with model:
         centre      = data[NUM_DIMENSIONS:2*NUM_DIMENSIONS]
         spread      = np.clip(data[2*NUM_DIMENSIONS:], MIN_WIDTH, SPREAD_MAX)
 
-        return np.clip(centre + variable * spread, -1.0, 1.0)
+        composed_v  = np.clip(centre + variable * spread, -1.0, 1.0)
+
+        smi, sgd    = state["curr_features"]
+        eps         = sgd * (1.0 - smi)
+        if (sgd >= 1.0) and (not state["stag_pulse"]) and (np.random.random() < eps):
+            state["stag_pulse"] = True
+            composed_v  = _archive_centroid_scaled() if state["archive"] else np.random.uniform(-1.0, 1.0, NUM_DIMENSIONS)
+            composed_v  = np.clip(composed_v + np.random.normal(0.0, 0.01, NUM_DIMENSIONS), -1.0, 1.0)
+            # composed_v  = np.random.uniform(-1.0, 1.0, NUM_DIMENSIONS)
+            # return v_seed
+            # print("*** RESET TRIGGERED at time {:.3f} s and eps {:.3f} ***".format(t, eps))
+
+        return composed_v
 
     compose_node = nengo.Node(
         label       = "compose_v",
@@ -171,7 +183,7 @@ with model:
         denominator = EPS + abs(state["prev_best_f"])
         improvement = difference / denominator
         state["smoothed_improv"] = np.clip(
-            ALPHA_IMPROV * state["smoothed_improv"] + (1 - ALPHA_IMPROV) * improvement,
+            ALPHA_IMPROV * improvement + (1 - ALPHA_IMPROV) * state["smoothed_improv"],
             0.0, 1.0).astype(float)
 
         # The smoothed improvement (smi) measures how well the optimisation is progressing, in [0, 1], where 1 is best, 0 is worst.
@@ -201,6 +213,7 @@ with model:
         size_in     = 0,
         size_out    = NUM_FEATURES,
     )
+
 
     # Selector node to keep track of the best-so-far
     def selector_func(t, x):
@@ -353,12 +366,6 @@ with model:
         # Determine epsilon based on spread and stagnation
         eps         = sgd * (1.0 - smi)
 
-        if (sgd >= 1.0) and (not state["stag_pulse"]) and (np.random.random() < eps):
-            state["stag_pulse"] = True
-            v_seed = _archive_centroid_scaled() if state["archive"] else np.random.uniform(-1.0, 1.0, NUM_DIMENSIONS)
-            v_seed = np.clip(v_seed + np.random.normal(0.0, 0.05, NUM_DIMENSIONS), -1.0, 1.0)
-            return v_seed
-
         # Move centre toward best_v, scaled by smi and sgd
         weight      = sgd ** 3.0
         centre_val  = (1.0 - weight) * best_v + weight * curr_v
@@ -368,14 +375,22 @@ with model:
         """Spread update teaching signal."""
         smi,sgd     = x
         eps         = sgd * (1.0 - smi)
-
+        #
         if (sgd >= 1.0) and (not state["stag_pulse"]) and (np.random.random() < eps):
             # centre function will set stag_pulse True; match with full spread
             return np.ones(NUM_DIMENSIONS)
 
+        vb, fb   = zip(*state["archive"]) if state["archive"] else ([], [])
+        if vb:
+            A       = np.array(vb)
+            mad     = np.median(np.abs(A - np.median(A, axis=0)), axis=0) + EPS
+            base    = np.clip(mad / np.max(mad), SPREAD_MIN, SPREAD_MAX)
+        else:
+            base    = SPREAD_MAX * np.ones(NUM_DIMENSIONS)
+
         # Reduce spread when improving, increase when stagnating
-        spread_val  = SPREAD_MIN + (SPREAD_MAX - 2 * SPREAD_MIN) * np.tanh(sgd * 2.0)
-        return spread_val * np.ones(NUM_DIMENSIONS)
+        spread_val  = SPREAD_MIN + base * np.tanh(sgd * 3.0)
+        return spread_val
 
     c_teaching_node = nengo.Node(
         label       = "centre_control",
@@ -393,6 +408,14 @@ with model:
 
     # CONNECTIONS
     # --------------------------------------------------------------
+
+    # Recurrent dynamics with leak
+    # nengo.Connection(
+    #     pre         = motor_ens.output,
+    #     post        = motor_ens.input,
+    #     synapse     = TAU_1,
+    #     transform   = (1.0 - CENTRE_LEAK) * np.eye(NUM_DIMENSIONS),
+    # )
 
     # [Pulser] --- v --> [EA input]
     nengo.Connection(
@@ -548,15 +571,15 @@ plt.legend()
 plt.show()
 
 #%%
-# Plot the decoded output of the ensemble
-plt.figure(figsize=(12, 8), dpi=150)
-# plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -1, 1, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
-plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
-# plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
-# plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
-plt.xlim(0, SIMULATION_TIME)
-plt.legend()
-plt.show()
+# # Plot the decoded output of the ensemble
+# plt.figure(figsize=(12, 8), dpi=150)
+# # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -1, 1, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
+# plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
+# # plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
+# # plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
+# plt.xlim(0, SIMULATION_TIME)
+# plt.legend()
+# plt.show()
 
 #%%
 plt.figure(figsize=(12, 8), dpi=150)
@@ -596,19 +619,19 @@ plt.show()
 #     spikes_cat.append(spikes)
 # spikes_cat = np.hstack(spikes_cat)
 
-plt.figure(figsize=(12, 8), dpi=150)
-spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
-# rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
-plt.imshow(spikes_cat.T, aspect="auto", cmap="pink_r", origin="lower",)
-
-t_indices = plt.gca().get_xticks().astype(int)
-t_indices = t_indices[t_indices >= 0.0]
-t_indices[-1] -= 1
-t_labels = [f"{sim.trange()[i]:.1f}" for i in t_indices]
-plt.xticks(t_indices, t_labels)
-
-plt.xlabel("Time, s")
-plt.ylabel("Neuron")
-plt.title("Spikes")
-# plt.xlim(0, SIMULATION_TIME)
-plt.show()
+# plt.figure(figsize=(12, 8), dpi=150)
+# spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
+# # rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
+# plt.imshow(spikes_cat.T, aspect="auto", cmap="pink_r", origin="lower",)
+#
+# t_indices = plt.gca().get_xticks().astype(int)
+# t_indices = t_indices[t_indices >= 0.0]
+# t_indices[-1] -= 1
+# t_labels = [f"{sim.trange()[i]:.1f}" for i in t_indices]
+# plt.xticks(t_indices, t_labels)
+#
+# plt.xlabel("Time, s")
+# plt.ylabel("Neuron")
+# plt.title("Spikes")
+# # plt.xlim(0, SIMULATION_TIME)
+# plt.show()
