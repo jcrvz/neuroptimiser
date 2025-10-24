@@ -13,9 +13,10 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 10  # Problem ID from the IOH framework
+PROBLEM_ID      = 1  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMS        = 10  # Number of dimensions for the problem
+NUM_SAMPLES     = 20
 
 NEURONS_PER_DIM = 100
 NEURONS_PER_ENS = 200
@@ -41,8 +42,16 @@ ALPHA_IMPROV    = 0.8
 EPS             = 1e-12
 TAU             = 0.01
 
-SPREAD_MAX     = 1.0
-SPREAD_MIN     = 1e-6
+ARCH_SIZE       = 64
+MU              = ARCH_SIZE // 4
+SIGMA_MIN       = 0.01
+SIGMA_MAX       = 0.5
+SPREAD_MAX      = 1.0
+SPREAD_MIN      = 1e-6
+D_EFF           = max(3, NUM_DIMS // 3)
+PSUCC_TARGET    = 0.2
+PSUCC_WINDOW    = 1.5
+
 
 #%%
 
@@ -60,9 +69,11 @@ with model:
         "best_f":           None,                   # best objective value
         "prev_best_f":      None,                   # previous best objective value
         "smoothed_improv":  1.0,                    # smoothed improvement metric
-        "t_stag_start":     0.0,                    # time when stagnation started
+        "t_last_improv":     0.0,                    # time when stagnation started
         "curr_features":    np.array([0.0, 0.0]),   # current features vector
         "archive":          deque(maxlen=64),       # small archive of best solutions
+        "sigma":            0.25,                   # global step-size (latent space)
+        # "t_last_improv":    0.0,                    # time of last improvement
     }
 
     # DEFINE THE MAIN COMPONENTS
@@ -79,19 +90,19 @@ with model:
         # max_rates       = nengo.dists.Uniform(80,220),
         # encoders        = nengo.dists.UniformHypersphere(surface=True),
         # neuron_type     = nengo.LIF(),
-        seed=SEED_VALUE,
+        # seed=SEED_VALUE,
     )
 
     # CENTRE and SPREAD Ensembles
     centre_ens  = nengo.Ensemble(
         label       = "Centre",
-        n_neurons   =NEURONS_PER_ENS + 20 * NUM_DIMS,
+        n_neurons   = NEURONS_PER_ENS + 20 * NUM_DIMS,
         dimensions  = NUM_DIMS,
         radius      = 1.5,
     )
     spread_ens = nengo.Ensemble(
         label       = "Spread",
-        n_neurons   =NEURONS_PER_ENS + 20 * NUM_DIMS,
+        n_neurons   = NEURONS_PER_ENS + 20 * NUM_DIMS,
         dimensions  = NUM_DIMS,
         radius      = 1.5,
     )
@@ -106,7 +117,7 @@ with model:
 
     compose_node = nengo.Node(
         label       = "Composition",
-        size_in     =3 * NUM_DIMS,
+        size_in     = 3 * NUM_DIMS,
         size_out    = NUM_DIMS,
         output      = compose_func,
     )
@@ -141,16 +152,19 @@ with model:
             state["best_v"]         = v.copy()
             state["best_x"]         = trs2o(state["best_v"], state["lb"], state["ub"])
 
-            state["t_stag_start"]   = t
+            state["t_last_improv"]   = t
             state["archive"].append((state["best_v"], state["best_f"]))
+
+            # state["t_last_improv"]  = t
+            # state["sigma"]          = min(SIGMA_MAX, state["sigma"] * np.exp((1.0 - PSUCC_TARGET) / D_EFF))
 
         return np.concatenate((state["best_v"], [state["best_f"]]))
 
     selector_node   = nengo.Node(
         label       = "Selector",
         output      = selector_func,
-        size_in     =NUM_DIMS + 1,
-        size_out    =NUM_DIMS + 1,
+        size_in     = NUM_DIMS + 1,
+        size_out    = NUM_DIMS + 1,
     )
 
     # FEATURES NODE: Extract features for utility computation
@@ -162,11 +176,15 @@ with model:
         denom       = EPS + abs(state["prev_best_f"])
         improv      = difff / denom
 
-        sgd         = np.clip((t - state["t_stag_start"]) / STAG_WAIT, 0.0, 1.0)
+        sgd         = np.clip((t - state["t_last_improv"]) / STAG_WAIT, 0.0, 1.0)
         smi         = ALPHA_IMPROV * state["smoothed_improv"] + (1 - ALPHA_IMPROV) * improv
         state["smoothed_improv"]    = np.clip(smi, 0.0, 1.0)
 
         state["curr_features"]      = np.array([smi, sgd], dtype=float)
+
+        if (t - state["t_last_improv"]) >= PSUCC_WINDOW:
+            state["sigma"]          = max(SIGMA_MIN, state["sigma"] * np.exp(-PSUCC_TARGET / D_EFF))
+
         return state["curr_features"]
 
     # Features node to extract features for utility computation
@@ -181,11 +199,17 @@ with model:
     def centre_control(t, x):
         best_v      = x[:NUM_DIMS]
         curr_v      = x[NUM_DIMS:2 * NUM_DIMS]
-        smi, sgd    = x[2 * NUM_DIMS:]
+        # smi, sgd  = x[2 * NUM_DIMS:]  # not used in the minimal controller
 
-        beta_c      = sgd ** 3.0
-        c_star      = (1 - beta_c) * curr_v + sgd * (beta_c * best_v + (1 - beta_c) * curr_v)
-        return c_star
+        if state["archive"]:
+            A        = list(state["archive"])
+            A_sorted = sorted(A, key=lambda item: item[1])
+            mu       = max(1, min(MU, len(A_sorted)//2))
+            v_bar    = np.mean([v for v, _ in A_sorted[:mu]], axis=0)
+        else:
+            v_bar    = best_v
+
+        return v_bar
 
     centre_ctrl_node = nengo.Node(
         label       = "Centre Control",
@@ -196,17 +220,8 @@ with model:
 
     # SPREAD CONTROLLER NODE: Compute spread based on features
     def spread_control(t, x):
-        smi,sgd     = x
-        sigma       = SPREAD_MIN * np.exp(2.0 * (sgd))
-
-        if state["archive"]:
-            A      = np.array([v for v, _ in state["archive"]])
-            mad    = np.median(np.abs(A - np.median(A, axis=0)), axis=0) + EPS
-            base   = np.clip(mad / (mad.max() + EPS), SPREAD_MIN, SPREAD_MAX)
-        else:
-            base   = SPREAD_MAX * np.ones(NUM_DIMS)
-
-        s_star     = np.clip(base * sigma, SPREAD_MIN, SPREAD_MAX)
+        # Minimal: isotropic spread governed only by global sigma
+        s_star = np.clip(np.full(NUM_DIMS, state["sigma"], dtype=float), SPREAD_MIN, SPREAD_MAX)
         return s_star
 
     spread_ctrl_node = nengo.Node(
@@ -218,10 +233,7 @@ with model:
 
     # PERTURBATION CONTROLLER NODE: Compute perturbation based on features
     def perturbation_control(t, u):
-        smi, sgd    = state["curr_features"]
-        eta         = max(1.0 - sgd, EPS)
-        sigma       = 0.05 + np.exp(2.0 * sgd)
-        return eta * (state["best_v"] - u) + np.random.normal(0, sigma, size=NUM_DIMS)
+        return np.random.normal(0.0, 1.0, size=NUM_DIMS)
 
     perturb_ctrl_node = nengo.Node(
         label       = "Perturbation Control",
@@ -401,10 +413,11 @@ plt.show()
 #     spikes_cat.append(spikes)
 # spikes_cat = np.hstack(spikes_cat)
 
+
 # plt.figure(figsize=(12, 8), dpi=150)
 # spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
 # # rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
-# plt.imshow(spikes_cat.T, aspect="auto", cmap="pink_r", origin="lower",)
+# plt.imshow(spikes_cat.T, aspect="auto", cmap="hsv", origin="lower",)
 #
 # t_indices = plt.gca().get_xticks().astype(int)
 # t_indices = t_indices[t_indices >= 0.0]
