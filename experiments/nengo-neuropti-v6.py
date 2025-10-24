@@ -13,10 +13,10 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 1  # Problem ID from the IOH framework
+PROBLEM_ID      = 12  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMS        = 10  # Number of dimensions for the problem
-NUM_SAMPLES     = 20
+NUM_OBJS        = 1   # Number of objectives (only single-objective supported here)
 
 NEURONS_PER_DIM = 100
 NEURONS_PER_ENS = 200
@@ -36,15 +36,16 @@ X_UPPER_BOUND0  = X_UPPER_BOUND.copy()
 
 # Exploitation (search-space shrinking) schedule
 SEED_VALUE      = 69
+# SAMPLING_TIME   = 1.0
 NUM_FEATURES    = 2
 STAG_WAIT       = 3.0
 ALPHA_IMPROV    = 0.8
 EPS             = 1e-12
 TAU             = 0.01
 
-ARCH_SIZE       = 64
-MU              = ARCH_SIZE // 4
-SIGMA_MIN       = 0.01
+LAMBDA          = 64
+MU              = LAMBDA // 2
+SIGMA_MIN       = 1e-3
 SIGMA_MAX       = 0.5
 SPREAD_MAX      = 1.0
 SPREAD_MIN      = 1e-6
@@ -69,11 +70,12 @@ with model:
         "best_f":           None,                   # best objective value
         "prev_best_f":      None,                   # previous best objective value
         "smoothed_improv":  1.0,                    # smoothed improvement metric
-        "t_last_improv":     0.0,                    # time when stagnation started
-        "curr_features":    np.array([0.0, 0.0]),   # current features vector
-        "archive":          deque(maxlen=64),       # small archive of best solutions
-        "sigma":            0.25,                   # global step-size (latent space)
-        # "t_last_improv":    0.0,                    # time of last improvement
+        "t_last_improv":    0.0,                    # time when stagnation started
+        "curr_features":    np.array([1.0, 0.0]),   # [smi, sgd]
+        "archive":          deque(maxlen=LAMBDA),       # small archive to represent the sampling phase
+        "archive_sorted":   None,                 # sorted archive
+        "sampling_stage":   True,                 # whether we are in sampling stage
+        "sigma":            0.25,                    # current spread value
     }
 
     # DEFINE THE MAIN COMPONENTS
@@ -133,7 +135,7 @@ with model:
         label       = "Problem",
         output      = objective_func,
         size_in     = NUM_DIMS,
-        size_out    =NUM_DIMS + 1,
+        size_out    = NUM_DIMS + NUM_OBJS,
     )
 
     state["best_f"]     = objective_func(0.0, state["best_v"])[-1]
@@ -153,22 +155,25 @@ with model:
             state["best_x"]         = trs2o(state["best_v"], state["lb"], state["ub"])
 
             state["t_last_improv"]   = t
-            state["archive"].append((state["best_v"], state["best_f"]))
+            # state["archive"].append((state["best_v"], state["best_f"]))
 
-            # state["t_last_improv"]  = t
-            # state["sigma"]          = min(SIGMA_MAX, state["sigma"] * np.exp((1.0 - PSUCC_TARGET) / D_EFF))
 
         return np.concatenate((state["best_v"], [state["best_f"]]))
 
     selector_node   = nengo.Node(
         label       = "Selector",
         output      = selector_func,
-        size_in     = NUM_DIMS + 1,
-        size_out    = NUM_DIMS + 1,
+        size_in     = NUM_DIMS + NUM_OBJS,
+        size_out    = NUM_DIMS + NUM_OBJS,
     )
 
     # FEATURES NODE: Extract features for utility computation
-    def features_func(t):
+    def features_func(t, vf):
+        # Update archive with current sample
+        v       = vf[:NUM_DIMS]
+        fv      = float(vf[NUM_DIMS:NUM_DIMS + NUM_OBJS])
+
+        # Update the current features based on improvement and stagnation
         if state["prev_best_f"] is None:
             state["prev_best_f"]    = state["best_f"]
 
@@ -176,14 +181,20 @@ with model:
         denom       = EPS + abs(state["prev_best_f"])
         improv      = difff / denom
 
+        smi, sgd = state["curr_features"]
+
         sgd         = np.clip((t - state["t_last_improv"]) / STAG_WAIT, 0.0, 1.0)
-        smi         = ALPHA_IMPROV * state["smoothed_improv"] + (1 - ALPHA_IMPROV) * improv
-        state["smoothed_improv"]    = np.clip(smi, 0.0, 1.0)
+        smi         = np.clip(ALPHA_IMPROV * smi + (1 - ALPHA_IMPROV) * improv, 0.0, 1.0)
+
+        # If it is in stagnation, we consider the sampling is over, so we update other features
+        if sgd >= 1.0:
+            state["sampling_stage"]     = True
+            state["archive"].append((v.copy(), fv))
+        else:
+            state["sampling_stage"]     = False
+            state["archive_sorted"]     = sorted(state["archive"], key=lambda item: item[1])
 
         state["curr_features"]      = np.array([smi, sgd], dtype=float)
-
-        if (t - state["t_last_improv"]) >= PSUCC_WINDOW:
-            state["sigma"]          = max(SIGMA_MIN, state["sigma"] * np.exp(-PSUCC_TARGET / D_EFF))
 
         return state["curr_features"]
 
@@ -191,15 +202,13 @@ with model:
     features_node = nengo.Node(
         label       = "features",
         output      = features_func,
-        size_in     = 0,
+        size_in     = NUM_DIMS + NUM_OBJS,
         size_out    = NUM_FEATURES,
     )
 
     # CENTRE CONTROLLER NODE: Compute centre based on features
     def centre_control(t, x):
-        best_v      = x[:NUM_DIMS]
-        curr_v      = x[NUM_DIMS:2 * NUM_DIMS]
-        # smi, sgd  = x[2 * NUM_DIMS:]  # not used in the minimal controller
+        smi, sgd = x
 
         if state["archive"]:
             A        = list(state["archive"])
@@ -213,15 +222,19 @@ with model:
 
     centre_ctrl_node = nengo.Node(
         label       = "Centre Control",
-        size_in     = 2 * NUM_DIMS + NUM_FEATURES,
+        size_in     = NUM_FEATURES,
         size_out    = NUM_DIMS,
         output      = centre_control,
     )
 
     # SPREAD CONTROLLER NODE: Compute spread based on features
     def spread_control(t, x):
-        # Minimal: isotropic spread governed only by global sigma
-        s_star = np.clip(np.full(NUM_DIMS, state["sigma"], dtype=float), SPREAD_MIN, SPREAD_MAX)
+        smi, sgd = x
+
+        # Anisotropic sigma: each dimension gets its own value based on features
+        # Example: modulate sigma by SMI and SGD for each dimension
+        s_star = np.clip(sigma * (1.0 + 0.5 * smi + 0.5 * sgd * np.arange(NUM_DIMS) / max(1, NUM_DIMS - 1)),
+                         SPREAD_MIN, SPREAD_MAX)
         return s_star
 
     spread_ctrl_node = nengo.Node(
@@ -245,7 +258,7 @@ with model:
     # PULSER NODE: Clock signal to trigger new proposals
     # Pulser function to inject the initial guess at t=0 and best_v after shrinks
     def pulser_func(t):
-        return state["best_v"] if t < 1e-3 else np.zeros(NUM_DIMS)
+        return state["best_v"] if t < 1e-3 else np.random.normal(0.0, 0.1, NUM_DIMS)
 
     # Pulser node to trigger actions
     pulser_node = nengo.Node(
@@ -257,12 +270,12 @@ with model:
     # TODO: this could be a memory
     # [Aux] Nodes to extract only fbest and xbest from the selector output
     fbest_only = nengo.Node(
-        size_in     =NUM_DIMS + 1,
+        size_in     =NUM_DIMS + NUM_OBJS,
         size_out    = 1,
         output      = lambda t, x: x[-1]
     )
     xbest_only = nengo.Node(
-        size_in     =NUM_DIMS + 1,
+        size_in     =NUM_DIMS + NUM_OBJS,
         size_out    = NUM_DIMS,
         output      = lambda t, x: trs2o(x[:NUM_DIMS], state["lb"], state["ub"])
     )
@@ -283,11 +296,10 @@ with model:
     # Environment evaluation
     nengo.Connection(compose_node,              obj_node,                                       synapse=None)
     nengo.Connection(obj_node,                  selector_node,                                  synapse=None)
+    nengo.Connection(obj_node,                  features_node,                                  synapse=None)
 
     # Centre control
-    nengo.Connection(selector_node[:NUM_DIMS], centre_ctrl_node[:NUM_DIMS], synapse=TAU)
-    nengo.Connection(motor.output, centre_ctrl_node[NUM_DIMS:2 * NUM_DIMS], synapse=TAU)
-    nengo.Connection(features_node, centre_ctrl_node[2 * NUM_DIMS:], synapse=TAU)
+    nengo.Connection(features_node, centre_ctrl_node, synapse=TAU)
     nengo.Connection(centre_ctrl_node, centre_ens, synapse=None)
     # nengo.Connection(centre_ens, centre_ens, synapse=TAU, transform=0.95*np.eye(NUM_DIMS))
 
