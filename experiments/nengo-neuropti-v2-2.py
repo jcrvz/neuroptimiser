@@ -117,7 +117,7 @@ with model:
     #     post        = motor_ens.input,
     #     synapse     = tau,
     #     function    = hs,
-    #     transform   = np.eye(NUM_DIMENSIONS),
+    #     transform   = np.eye(NUM_DIMS),
     # )
     hs_node = nengo.Node(
         label       = "hs",
@@ -175,19 +175,19 @@ with model:
     # Controller towards the best-so-far
     # eta = 0.2 # Learning rate or movement rate towards the best
     # def controller(t, x):
-    #     best_v  = x[:NUM_DIMENSIONS]
-    #     curr_v  = x[NUM_DIMENSIONS:]
+    #     best_v  = x[:NUM_DIMS]
+    #     curr_v  = x[NUM_DIMS:]
     #     return eta * (best_v - curr_v)
 
     # control_node = nengo.Node(
     #     label="controller",
     #     output=controller,
-    #     size_in=2 * NUM_DIMENSIONS,
-    #     size_out=NUM_DIMENSIONS,
+    #     size_in=2 * NUM_DIMS,
+    #     size_out=NUM_DIMS,
     # )
 
-    # nengo.Connection(selector_node[:NUM_DIMENSIONS], control_node[:NUM_DIMENSIONS], synapse=0)
-    # nengo.Connection(ens_lif, control_node[NUM_DIMENSIONS:], synapse=0)      # Current state vector
+    # nengo.Connection(selector_node[:NUM_DIMS], control_node[:NUM_DIMS], synapse=0)
+    # nengo.Connection(ens_lif, control_node[NUM_DIMS:], synapse=0)      # Current state vector
 
     # nengo.Connection(control_node, ens_lif, synapse=0.01)  # Apply control to the ensemble
 
@@ -284,7 +284,7 @@ plt.show()
 #%%
 # Plot the decoded output of the ensemble
 plt.figure()
-# plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
+# plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
 plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
 # plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
 plt.xlim(0, simulation_time)
@@ -294,7 +294,7 @@ plt.show()
 # Plot the decoded output of the ensemble
 plt.figure()
 plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
-# plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
+# plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
 # plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
 plt.xlim(0, simulation_time)
 plt.legend()

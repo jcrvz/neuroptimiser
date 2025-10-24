@@ -260,7 +260,7 @@ with model:
             new_lb, new_ub              = X_LOWER_BOUND0.copy(), X_UPPER_BOUND0.copy()
 
             # Recompute best_v under the RESET bounds
-            # current_best_x              = np.random.uniform(new_lb, new_ub, NUM_DIMENSIONS)
+            # current_best_x              = np.random.uniform(new_lb, new_ub, NUM_DIMS)
             current_best_x              = np.array(state["best_x"])
             new_best_v                  = tro2s(current_best_x, new_lb, new_ub)
 
@@ -422,7 +422,7 @@ with model:
         if (t < 0.01) or (t <= state["retarget_until"]):
             return v0_state.copy()
         # if t <= state["retarget_until"] and state["best_v"] is not None:
-            # return state["best_v"] + np.random.normal(0, 0.01, size=NUM_DIMENSIONS)
+            # return state["best_v"] + np.random.normal(0, 0.01, size=NUM_DIMS)
         return np.zeros(NUM_DIMENSIONS)
 
     # Pulser node to trigger actions
@@ -657,7 +657,7 @@ plt.show()
 #%%
 # Plot the decoded output of the ensemble
 plt.figure(figsize=(12, 8), dpi=150)
-# plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
+# plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -5, 5, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
 add_colors()
 plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
@@ -672,7 +672,7 @@ plt.figure(figsize=(12, 8), dpi=150)
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -1, 1, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
 add_colors()
 plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
-# plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
+# plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
 # plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
 plt.xlim(0, SIMULATION_TIME)
 plt.legend()

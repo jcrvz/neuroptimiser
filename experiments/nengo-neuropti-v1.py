@@ -133,19 +133,19 @@ with model:
     # Controller towards the best-so-far
     # eta = 0.2 # Learning rate or movement rate towards the best
     # def controller(t, x):
-    #     best_v  = x[:NUM_DIMENSIONS]
-    #     curr_v  = x[NUM_DIMENSIONS:]
+    #     best_v  = x[:NUM_DIMS]
+    #     curr_v  = x[NUM_DIMS:]
     #     return eta * (best_v - curr_v)
 
     # control_node = nengo.Node(
     #     label="controller",
     #     output=controller,
-    #     size_in=2 * NUM_DIMENSIONS,
-    #     size_out=NUM_DIMENSIONS,
+    #     size_in=2 * NUM_DIMS,
+    #     size_out=NUM_DIMS,
     # )
 
-    # nengo.Connection(selector_node[:NUM_DIMENSIONS], control_node[:NUM_DIMENSIONS], synapse=0)
-    # nengo.Connection(ens_lif, control_node[NUM_DIMENSIONS:], synapse=0)      # Current state vector
+    # nengo.Connection(selector_node[:NUM_DIMS], control_node[:NUM_DIMS], synapse=0)
+    # nengo.Connection(ens_lif, control_node[NUM_DIMS:], synapse=0)      # Current state vector
 
     # nengo.Connection(control_node, ens_lif, synapse=0.01)  # Apply control to the ensemble
 

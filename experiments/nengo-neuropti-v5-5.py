@@ -13,7 +13,7 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 10  # Problem ID from the IOH framework
+PROBLEM_ID      = 15  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
 
@@ -50,19 +50,19 @@ NUM_ACTIONS     = len(ACTIONS)
 SEED_VALUE      = 69
 INIT_WAIT_TIME  = 0.01
 DEFAULT_WAIT    = 0.01       # seconds between action operations
-STAG_WAIT       = 0.2       #max(0.01, 0.1 * SIMULATION_TIME)       # seconds of stagnation before a RESET to global bounds
+STAG_WAIT       = max(0.01, SIMULATION_TIME * 0.1)       # seconds of stagnation before a RESET to global bounds
 EPS             = 1e-12     # small value to ensure numerical ordering of bounds
 MIN_WIDTH       = 1e-6      # do not shrink any dimension below this absolute width
 MIN_PROPORTION  = 1e-4      # do not shrink the box below this proportion of the original box
-MIN_IMPROVEMENT = 0.5      # minimum improvement to consider the optimisation progressing
+MIN_IMPROVEMENT = 1e-6      # minimum improvement to consider the optimisation progressing
 ALPHA_IMPROV    = 0.8       # EWMA alpha for improvement smoothing / depends on dt
-TAU_1           = 0.01       # time constant
-TAU_2           = 0.01        # time constant
-CENTRE_LEAK    = 0.05       # leak for centre integrator
+TAU_1           = 0.02       # time constant
+TAU_2           = 0.02        # time constant
+CENTRE_LEAK    = 0.03       # leak for centre integrator
 SPREAD_LEAK    = 0.08       # leak for spread integrator
 
 SPREAD_MAX     = 1.0
-SPREAD_MIN     = 1e-3
+SPREAD_MIN     = 1e-6
 NUM_FEATURES    = 2
 
 
@@ -133,19 +133,7 @@ with model:
         centre      = data[NUM_DIMENSIONS:2*NUM_DIMENSIONS]
         spread      = np.clip(data[2*NUM_DIMENSIONS:], MIN_WIDTH, SPREAD_MAX)
 
-        composed_v  = np.clip(centre + variable * spread, -1.0, 1.0)
-
-        smi, sgd    = state["curr_features"]
-        eps         = sgd * (1.0 - smi)
-        if (sgd >= 1.0) and (not state["stag_pulse"]) and (np.random.random() < eps):
-            state["stag_pulse"] = True
-            composed_v  = _archive_centroid_scaled() if state["archive"] else np.random.uniform(-1.0, 1.0, NUM_DIMENSIONS)
-            composed_v  = np.clip(composed_v + np.random.normal(0.0, 0.01, NUM_DIMENSIONS), -1.0, 1.0)
-            # composed_v  = np.random.uniform(-1.0, 1.0, NUM_DIMS)
-            # return v_seed
-            # print("*** RESET TRIGGERED at time {:.3f} s and eps {:.3f} ***".format(t, eps))
-
-        return composed_v
+        return np.clip(centre + variable * spread, -1.0, 1.0)
 
     compose_node = nengo.Node(
         label       = "compose_v",
@@ -183,7 +171,7 @@ with model:
         denominator = EPS + abs(state["prev_best_f"])
         improvement = difference / denominator
         state["smoothed_improv"] = np.clip(
-            ALPHA_IMPROV * improvement + (1 - ALPHA_IMPROV) * state["smoothed_improv"],
+            ALPHA_IMPROV * state["smoothed_improv"] + (1 - ALPHA_IMPROV) * improvement,
             0.0, 1.0).astype(float)
 
         # The smoothed improvement (smi) measures how well the optimisation is progressing, in [0, 1], where 1 is best, 0 is worst.
@@ -215,6 +203,20 @@ with model:
     )
 
 
+    def _add_to_archive(v, f):
+        """Add to archive with distance-based deduplication."""
+        MIN_ARCHIVE_DIST = 0.1  # in scaled space
+
+        # Remove near-duplicates
+        kept = []
+        for vi, fi in state["archive"]:
+            if np.linalg.norm(v - vi) >= MIN_ARCHIVE_DIST:
+                kept.append((vi, fi))
+
+        kept.append((v.copy(), float(f)))
+        kept.sort(key=lambda t: t[1])  # sort by fitness
+        state["archive"] = deque(kept[:16], maxlen=16)  # keep top 16
+
     # Selector node to keep track of the best-so-far
     def selector_func(t, x):
 
@@ -227,6 +229,7 @@ with model:
 
         # Update improvement metrics
         if state["best_f"] is None or (fv < state["best_f"] and t >= INIT_WAIT_TIME):
+            _add_to_archive(state["best_v"], state["best_f"])
             # Register the previous best
             state["prev_best_f"] = state["best_f"]
 
@@ -258,8 +261,8 @@ with model:
             return np.zeros_like(x)
 
         smi, sgd    = state["curr_features"]
-        eta         = 1.0 - sgd
-        sigma       = 0.05 + 0.45 * sgd
+        eta         = 0.3 * (1.0 - sgd)
+        sigma       = 0.02 + 0.15 * sgd
 
         # # OPTION 2: Heavy-tail only when stagnated
         # # Optional heavy tail during full stagnation using existing RNG
@@ -298,50 +301,50 @@ with model:
         return centroid
 
     # Pulser function to inject the initial guess at t=0 and best_v after shrinks
-    def pulser_func(t):
-        if t < INIT_WAIT_TIME:
-            return v0_state.copy()
-        # if t - state["t_stag_start"] >= 2 * STAG_WAIT:
-        #     sigma       = sgd * 0.5
-        #     return state["best_v"] + np.random.normal(0, sigma, size=NUM_DIMS)
+    # def pulser_func(t):
+    #     if t < INIT_WAIT_TIME:
+    #         return v0_state.copy()
+    #     # if t - state["t_stag_start"] >= 2 * STAG_WAIT:
+    #     #     sigma       = sgd * 0.5
+    #     #     return state["best_v"] + np.random.normal(0, sigma, size=NUM_DIMS)
+    #
+    #     smi, sgd    = state["curr_features"]
+    #     # Option 1:
+    #     if (sgd >= 1.0): # and (not state["stag_pulse"]):
+    #         return np.zeros(NUM_DIMS)
+    #         # state["stag_pulse"] = True
+    #         # zero centre to sample around 0, or archive centroid for informed restart
+    #         # v_seed      = _archive_centroid_scaled() if state["archive"] else np.zeros(NUM_DIMS)
+    #         # jitter      = np.random.normal(0.0, 0.05, NUM_DIMS)
+    #         # return np.clip(v_seed + jitter, -1.0, 1.0)
+    #
+    #     # Option 3: Partial re-sampling of dimensions during stagnation
+    #     # if sgd >= 1.0 and np.random.rand() < 0.5:
+    #     #     # Base seed: zero centre or archive centroid if you already have it
+    #     #     v_seed = np.zeros(NUM_DIMS)
+    #     #     # If you kept the small archive helper, uncomment:
+    #     #     # v_seed = _archive_centroid_scaled() if state["archive"] else v_seed
+    #     #
+    #     #     # Rotate a simple dimension mask with no new knobs
+    #     #     # Bout 1: even dims; Bout 2: odd dims; then repeat
+    #     #     mask = np.zeros(NUM_DIMS, dtype=bool)
+    #     #     mask[np.random.choice(NUM_DIMS, size=NUM_DIMS//2, replace=False)] = True
+    #     #
+    #     #     # Sample only masked dims globally in scaled space; keep others
+    #     #     new_vals = np.random.uniform(-1.0, 1.0, size=NUM_DIMS)
+    #     #     v_curr = state["best_v"] if state["best_v"] is not None else v_seed
+    #     #     v_next = np.where(mask, new_vals, v_curr)
+    #     #
+    #     #     return np.clip(v_next, -1.0, 1.0)
+    #
+    #     return np.zeros(NUM_DIMS)
 
-        smi, sgd    = state["curr_features"]
-        # Option 1:
-        if (sgd >= 1.0): # and (not state["stag_pulse"]):
-            return np.zeros(NUM_DIMENSIONS)
-            # state["stag_pulse"] = True
-            # zero centre to sample around 0, or archive centroid for informed restart
-            # v_seed      = _archive_centroid_scaled() if state["archive"] else np.zeros(NUM_DIMS)
-            # jitter      = np.random.normal(0.0, 0.05, NUM_DIMS)
-            # return np.clip(v_seed + jitter, -1.0, 1.0)
-
-        # Option 3: Partial re-sampling of dimensions during stagnation
-        # if sgd >= 1.0 and np.random.rand() < 0.5:
-        #     # Base seed: zero centre or archive centroid if you already have it
-        #     v_seed = np.zeros(NUM_DIMS)
-        #     # If you kept the small archive helper, uncomment:
-        #     # v_seed = _archive_centroid_scaled() if state["archive"] else v_seed
-        #
-        #     # Rotate a simple dimension mask with no new knobs
-        #     # Bout 1: even dims; Bout 2: odd dims; then repeat
-        #     mask = np.zeros(NUM_DIMS, dtype=bool)
-        #     mask[np.random.choice(NUM_DIMS, size=NUM_DIMS//2, replace=False)] = True
-        #
-        #     # Sample only masked dims globally in scaled space; keep others
-        #     new_vals = np.random.uniform(-1.0, 1.0, size=NUM_DIMS)
-        #     v_curr = state["best_v"] if state["best_v"] is not None else v_seed
-        #     v_next = np.where(mask, new_vals, v_curr)
-        #
-        #     return np.clip(v_next, -1.0, 1.0)
-
-        return np.zeros(NUM_DIMENSIONS)
-
-    # Pulser node to trigger actions
-    pulser_node = nengo.Node(
-        label="pulser",
-        output=pulser_func,
-        size_out=NUM_DIMENSIONS,
-    )
+    # # Pulser node to trigger actions
+    # pulser_node = nengo.Node(
+    #     label="pulser",
+    #     output=pulser_func,
+    #     size_out=NUM_DIMS,
+    # )
 
     # TODO: this could be a memory
     # [Aux] Nodes to extract only fbest and xbest from the selector output
@@ -358,39 +361,21 @@ with model:
 
     # LEARNING RULES (Teaching signals)
     def _c_teaching_func(t, x):
-        """Centre update teaching signal."""
-        best_v      = x[:NUM_DIMENSIONS]
-        curr_v      = x[NUM_DIMENSIONS:2*NUM_DIMENSIONS]
-        smi, sgd    = x[2*NUM_DIMENSIONS:]
-
-        # Determine epsilon based on spread and stagnation
-        eps         = sgd * (1.0 - smi)
+        best_v = x[:NUM_DIMENSIONS]
+        smi, sgd = x[2 * NUM_DIMENSIONS:]
 
         # Move centre toward best_v, scaled by smi and sgd
-        weight      = sgd ** 3.0
-        centre_val  = (1.0 - weight) * best_v + weight * curr_v
-        return centre_val
+        # weight      = sgd ** 3.0
+        # centre_val  = (1.0 - weight) * best_v
+        return best_v
 
     def _s_teaching_func(t, x):
-        """Spread update teaching signal."""
-        smi,sgd     = x
-        eps         = sgd * (1.0 - smi)
-        #
-        if (sgd >= 1.0) and (not state["stag_pulse"]) and (np.random.random() < eps):
-            # centre function will set stag_pulse True; match with full spread
-            return np.ones(NUM_DIMENSIONS)
+        smi, sgd = x
 
-        vb, fb   = zip(*state["archive"]) if state["archive"] else ([], [])
-        if vb:
-            A       = np.array(vb)
-            mad     = np.median(np.abs(A - np.median(A, axis=0)), axis=0) + EPS
-            base    = np.clip(mad / np.max(mad), SPREAD_MIN, SPREAD_MAX)
-        else:
-            base    = SPREAD_MAX * np.ones(NUM_DIMENSIONS)
+        # Shrink when improving (smi high), expand when stagnating (sgd high)
+        target = SPREAD_MIN + (SPREAD_MAX - SPREAD_MIN) * np.clip(sgd - 0.3 * smi, 0.0, 1.0)
+        return target * np.ones(NUM_DIMENSIONS)
 
-        # Reduce spread when improving, increase when stagnating
-        spread_val  = SPREAD_MIN + base * np.tanh(sgd * 3.0)
-        return spread_val
 
     c_teaching_node = nengo.Node(
         label       = "centre_control",
@@ -406,38 +391,55 @@ with model:
         output      = _s_teaching_func,
     )
 
+    # Replace teaching nodes with integrator ensembles
+
+    centre_int = nengo.networks.EnsembleArray(
+        n_neurons=NEURONS_PER_ENS, n_ensembles=NUM_DIMENSIONS,
+        ens_dimensions=1, radius=1.5, label="centre_integrator"
+    )
+
+    spread_int = nengo.networks.EnsembleArray(
+        n_neurons=NEURONS_PER_ENS, n_ensembles=NUM_DIMENSIONS,
+        ens_dimensions=1, radius=2.0, label="spread_integrator"
+    )
+
     # CONNECTIONS
     # --------------------------------------------------------------
 
-    # Recurrent dynamics with leak
-    # nengo.Connection(
-    #     pre         = motor_ens.output,
-    #     post        = motor_ens.input,
-    #     synapse     = TAU,
-    #     transform   = (1.0 - CENTRE_LEAK) * np.eye(NUM_DIMS),
-    # )
-
-    # [Pulser] --- v --> [EA input]
-    nengo.Connection(
-        pre         = pulser_node,
-        post        = motor_ens.input,
-        synapse     = None,
-    )
-
-    # [EA output] --- x --> [Selector]
     nengo.Connection(
         pre         = motor_ens.output,
-        post        = hs_node,
-        synapse     = 0,
+        post        = motor_ens.input,
+        synapse     = TAU_1,
+        transform   = 0.95 * np.eye(NUM_DIMENSIONS),
     )
 
-    # [Selector] --- x (delayed) --> [EA input]
+    nengo.Connection(
+        pre        = motor_ens.output,
+        post       = hs_node,
+        synapse    = None,
+    )
+
     nengo.Connection(
         pre         = hs_node,
         post        = motor_ens.input,
         synapse     = TAU_1,
-        transform   = np.eye(NUM_DIMENSIONS),
+        transform   = 0.3 * np.eye(NUM_DIMENSIONS)
     )
+
+    # [Pulser] --- v --> [EA input]
+    # nengo.Connection(
+    #     pre         = pulser_node,
+    #     post        = motor_ens.input,
+    #     synapse     = None,
+    # )
+
+    # [Selector] --- x (delayed) --> [EA input]
+    # nengo.Connection(
+    #     pre         = hs_node,
+    #     post        = motor_ens.input,
+    #     synapse     = TAU,
+    #     transform   = np.eye(NUM_DIMS),
+    # )
 
     # [EA output] + [Centre] + [Spread] --> [Compose v]
     nengo.Connection(
@@ -445,16 +447,28 @@ with model:
         post        = compose_node[:NUM_DIMENSIONS],
         synapse     = 0,
     )
-    nengo.Connection(
-        pre         = c_teaching_node,
-        post        = compose_node[NUM_DIMENSIONS:2*NUM_DIMENSIONS],
-        synapse     = TAU_2,
-    )
-    nengo.Connection(
-        pre         = s_teaching_node,
-        post        = compose_node[2*NUM_DIMENSIONS:],
-        synapse     = TAU_2,
-    )
+    # nengo.Connection(
+    #     pre         = c_teaching_node,
+    #     post        = compose_node[NUM_DIMS:2*NUM_DIMS],
+    #     synapse     = TAU_2,
+    # )
+    # nengo.Connection(
+    #     pre         = s_teaching_node,
+    #     post        = compose_node[2*NUM_DIMS:],
+    #     synapse     = TAU_2,
+    # )
+
+    # Self-recurrence with leak
+    nengo.Connection(centre_int.output, centre_int.input, synapse=0.05, transform=(1.0 - CENTRE_LEAK))
+    nengo.Connection(spread_int.output, spread_int.input, synapse=0.05, transform=(1.0 - SPREAD_LEAK))
+
+    # Teaching signals drive the integrators
+    nengo.Connection(c_teaching_node, centre_int.input, synapse=0.02, transform=CENTRE_LEAK)
+    nengo.Connection(s_teaching_node, spread_int.input, synapse=0.02, transform=SPREAD_LEAK)
+
+    # Use integrator outputs in composition
+    nengo.Connection(centre_int.output, compose_node[NUM_DIMENSIONS:2 * NUM_DIMENSIONS], synapse=0)
+    nengo.Connection(spread_int.output, compose_node[2 * NUM_DIMENSIONS:], synapse=0)
 
     # [Compose v] --- v --> [Objective function]
     nengo.Connection(
@@ -571,15 +585,15 @@ plt.legend()
 plt.show()
 
 #%%
-# # Plot the decoded output of the ensemble
-# plt.figure(figsize=(12, 8), dpi=150)
-# # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -1, 1, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
-# plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
-# # plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
-# # plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
-# plt.xlim(0, SIMULATION_TIME)
-# plt.legend()
-# plt.show()
+# Plot the decoded output of the ensemble
+plt.figure(figsize=(12, 8), dpi=150)
+# plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -1, 1, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
+plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
+# plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
+# plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
+plt.xlim(0, SIMULATION_TIME)
+plt.legend()
+plt.show()
 
 #%%
 plt.figure(figsize=(12, 8), dpi=150)
@@ -619,19 +633,19 @@ plt.show()
 #     spikes_cat.append(spikes)
 # spikes_cat = np.hstack(spikes_cat)
 
-# plt.figure(figsize=(12, 8), dpi=150)
-# spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
-# # rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
-# plt.imshow(spikes_cat.T, aspect="auto", cmap="pink_r", origin="lower",)
-#
-# t_indices = plt.gca().get_xticks().astype(int)
-# t_indices = t_indices[t_indices >= 0.0]
-# t_indices[-1] -= 1
-# t_labels = [f"{sim.trange()[i]:.1f}" for i in t_indices]
-# plt.xticks(t_indices, t_labels)
-#
-# plt.xlabel("Time, s")
-# plt.ylabel("Neuron")
-# plt.title("Spikes")
-# # plt.xlim(0, SIMULATION_TIME)
-# plt.show()
+plt.figure(figsize=(12, 8), dpi=150)
+spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
+# rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
+plt.imshow(spikes_cat.T, aspect="auto", cmap="pink_r", origin="lower",)
+
+t_indices = plt.gca().get_xticks().astype(int)
+t_indices = t_indices[t_indices >= 0.0]
+t_indices[-1] -= 1
+t_labels = [f"{sim.trange()[i]:.1f}" for i in t_indices]
+plt.xticks(t_indices, t_labels)
+
+plt.xlabel("Time, s")
+plt.ylabel("Neuron")
+plt.title("Spikes")
+# plt.xlim(0, SIMULATION_TIME)
+plt.show()

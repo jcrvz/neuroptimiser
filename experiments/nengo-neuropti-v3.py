@@ -121,7 +121,7 @@ with model:
             return np.zeros_like(x)
         # best_v = state["best_v"]
         # return x + eta * (state["best_v"] - x) + np.random.normal(0, 0.1, size=x.shape)
-        # return x * eta + phi * (state["best_v"] - x) * np.random.rand(NUM_DIMENSIONS)
+        # return x * eta + phi * (state["best_v"] - x) * np.random.rand(NUM_DIMS)
         return x + eta * (state["best_v"] - x) #+ np.random.normal(0, 0.1, size=x.shape)  # Add some noise for exploration
 
     hs_node     = nengo.Node(
@@ -399,7 +399,7 @@ plt.show()
 #%%
 # Plot the decoded output of the ensemble
 plt.figure()
-# plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
+# plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -5, 5, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
 add_colors()
 plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
@@ -414,7 +414,7 @@ plt.figure()
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -1, 1, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
 add_colors()
 plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
-# plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMENSIONS)])
+# plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
 # plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
 plt.xlim(0, SIMULATION_TIME)
 plt.legend()
