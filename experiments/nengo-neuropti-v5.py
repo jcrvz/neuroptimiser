@@ -413,7 +413,7 @@ with model:
     # nengo.Connection(
     #     pre         = motor_ens.output,
     #     post        = motor_ens.input,
-    #     synapse     = TAU,
+    #     synapse     = TAU_2,
     #     transform   = (1.0 - CENTRE_LEAK) * np.eye(NUM_DIMS),
     # )
 

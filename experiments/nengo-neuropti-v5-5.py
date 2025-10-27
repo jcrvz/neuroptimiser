@@ -437,7 +437,7 @@ with model:
     # nengo.Connection(
     #     pre         = hs_node,
     #     post        = motor_ens.input,
-    #     synapse     = TAU,
+    #     synapse     = TAU_2,
     #     transform   = np.eye(NUM_DIMS),
     # )
 

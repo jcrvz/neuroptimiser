@@ -1,5 +1,6 @@
 #%%
 import secrets
+from pyexpat import features
 
 import matplotlib.pyplot as plt
 import nengo
@@ -13,14 +14,14 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 12  # Problem ID from the IOH framework
+PROBLEM_ID      = 10  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
-NUM_DIMS        = 10  # Number of dimensions for the problem
 NUM_OBJS        = 1   # Number of objectives (only single-objective supported here)
+NUM_DIMS        = 2  # Number of dimensions for the problem
 
 NEURONS_PER_DIM = 100
 NEURONS_PER_ENS = 200
-SIMULATION_TIME = 20.0  # seconds
+SIMULATION_TIME = 50.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMS)
 problem.reset()
@@ -39,20 +40,33 @@ SEED_VALUE      = 69
 # SAMPLING_TIME   = 1.0
 NUM_FEATURES    = 2
 STAG_WAIT       = 3.0
-ALPHA_IMPROV    = 0.8
+ALPHA_IMPROV    = 0.20
 EPS             = 1e-12
-TAU             = 0.01
+
+TAU_0 = TAU_1 = TAU_2 = TAU_3 = 0.01
+# TAU_0           = 0.01
+# TAU_1           = 0.01
+# TAU_2           = 0.02
+# TAU_3           = 0.03
+LEAK            = 1.0
 
 LAMBDA          = 64
-MU              = LAMBDA // 2
-SIGMA_MIN       = 1e-3
-SIGMA_MAX       = 0.5
-SPREAD_MAX      = 1.0
+MU              = max(1, LAMBDA // 4)
+SIGMA_MIN       = 1e-6
+SIGMA_MAX       = 0.25
 SPREAD_MIN      = 1e-6
+SPREAD_MAX      = 1.0
 D_EFF           = max(3, NUM_DIMS // 3)
 PSUCC_TARGET    = 0.2
 PSUCC_WINDOW    = 1.5
 
+THRESHOLD_V    = 1e-3
+
+_DENOM         = np.sqrt(max(3, NUM_DIMS))
+GAIN_1         = 5.0 / _DENOM
+GAIN_2         = 1.0 / (0.5 * GAIN_1)
+ETA_S          = 0.3 / _DENOM
+ETA_G          = 0.2 / _DENOM
 
 #%%
 
@@ -66,62 +80,159 @@ with model:
         "lb":               X_LOWER_BOUND.copy(),   # dynamic local bounds
         "ub":               X_UPPER_BOUND.copy(),
         "best_v":           X_INITIAL_GUESS.copy(),
-        "best_x":           tro2s(X_INITIAL_GUESS, X_LOWER_BOUND, X_UPPER_BOUND),
+        "prev_best_v":      X_INITIAL_GUESS.copy(),
         "best_f":           None,                   # best objective value
         "prev_best_f":      None,                   # previous best objective value
         "smoothed_improv":  1.0,                    # smoothed improvement metric
         "t_last_improv":    0.0,                    # time when stagnation started
         "curr_features":    np.array([1.0, 0.0]),   # [smi, sgd]
         "archive":          deque(maxlen=LAMBDA),       # small archive to represent the sampling phase
-        "archive_sorted":   None,                 # sorted archive
+        # "archive_sorted":   None,                 # sorted archive
         "sampling_stage":   True,                 # whether we are in sampling stage
         "sigma":            0.25,                    # current spread value
+        "flip":             1.0,
     }
 
     # DEFINE THE MAIN COMPONENTS
     # --------------------------------------------------------------
 
-    # MOTOR ENSEMBLE: Perturbation generator
-    motor       = nengo.networks.EnsembleArray(
-        label           = "Neural State",
+    # NOISE SOURCE: Generates perturbations
+    def noise_func(t):
+        _z  = np.random.normal(0.0, 1.0, NUM_DIMS)
+        state["flip"] *= -1.0
+        return state["flip"] * np.clip(_z, -3.0, 3.0)
+
+    noise_node = nengo.Node(
+        label       = "Noise Source",
+        output      = noise_func,
+        size_out    = NUM_DIMS,
+    )
+
+    motor_noise     = nengo.Ensemble(
+        label           = "Motor Noise",
+        n_neurons       = NEURONS_PER_ENS,
+        dimensions      = NUM_DIMS,
+        radius          = 3.0,
+    )
+
+    # Initial conditions for motors
+    init_centre     = nengo.Node(
+        label       = "Init Centre",
+        output      = lambda t: X_INITIAL_GUESS.copy() if t < 0.01 else np.zeros(NUM_DIMS),
+        size_out    = NUM_DIMS,
+    )
+    init_spread = nengo.Node(
+        label       = "Init Spread",
+        output      = lambda t: np.log(0.25) * np.ones(NUM_DIMS) if t < 0.01 else np.zeros(NUM_DIMS),
+        size_out    = NUM_DIMS,
+    )
+
+    # Centre control
+    def centroid_func(t):
+        if state["archive"]:
+            A       = sorted(state["archive"], key=lambda _x: _x[1])  # sort by fitness
+            mu      = max(1, min(MU, len(A)//2))
+            elite   = np.array([v for v,_ in A[:mu]])
+            ranks   = np.arange(1, mu+1)
+            weights = np.log(mu + 0.5) - np.log(ranks)
+            weights /= np.sum(weights)
+            return weights @ elite
+        return state["best_v"]
+
+    centroid_node = nengo.Node(
+        label       = "EW Centroid",
+        output      = centroid_func,
+        size_out    = NUM_DIMS,
+    )
+
+    # Error ensemble to compute error between best and centroid
+    error_centre = nengo.Ensemble(
+        label           = "Centre Error",
+        n_neurons       = NEURONS_PER_ENS + 10 * NUM_DIMS,
+        dimensions      = NUM_DIMS,
+        radius          = 2.0,
+    )
+
+    # CENTRE Ensemble and control
+    motor_centre  = nengo.Ensemble(
+        label           = "Motor Centre",
+        n_neurons       = NEURONS_PER_DIM,
+        dimensions      = NUM_DIMS,
+        radius          = 2.0,
+    )
+
+    # Scalar gain
+    gain_product    = nengo.networks.Product(
+        label       = "Gain Product",
+        n_neurons   = NEURONS_PER_ENS,
+        dimensions  = NUM_DIMS,
+    )
+
+    gain_bias = nengo.Node(
+        label       = "Gain Bias",
+        output      = 0.5 * GAIN_1 * np.ones(NUM_DIMS),
+    )
+
+    # SPREAD (log) Ensemble and control
+    motor_logsigma = nengo.Ensemble(
+        label           = "Motor Spread",
+        n_neurons       = NEURONS_PER_DIM,
+        dimensions      = NUM_DIMS,
+        radius          = 1.5,
+    )
+
+    # Clamp spread to [SPREAD_MIN, SPREAD_MAX]
+    clamp_spread = nengo.Node(
+        label       = "Clamp Spread",
+        size_in     = NUM_DIMS,
+        size_out    = NUM_DIMS,
+        output      = lambda t, _x: np.clip(np.exp(_x), SPREAD_MIN, SPREAD_MAX),
+    )
+
+    # Shrink when stagnation is detected
+    shrink_gate = nengo.networks.Product(
+        label       = "Shrink Gate",
+        n_neurons   = NEURONS_PER_ENS,
+        dimensions  = NUM_DIMS,
+    )
+
+    # Grow when significant improvement is detected
+    grow_gate = nengo.networks.Product(
+        label       = "Grow Gate",
+        n_neurons   = NEURONS_PER_ENS,
+        dimensions  = NUM_DIMS,
+    )
+
+    # inhibit_grow = nengo.Node(
+    #     label       = "Inhibit Grow",
+    #     size_in     = 1,
+    #     size_out    = NUM_DIMS,
+    #     output      = lambda t, x: -x[0] * np.ones(NUM_DIMS),
+    # )
+    #
+    # inhibit_shrink = nengo.Node(
+    #     label       = "Inhibit Shrink",
+    #     size_in     = 1,
+    #     size_out    = NUM_DIMS,
+    #     output      = lambda t, x: -x[0] * np.ones(NUM_DIMS),
+    # )
+
+
+    # COMPOSE NODE: Combine centre and spread into state vector
+    mult_spread_noise   = nengo.networks.Product(
+        label       = "Spread * Noise",
+        n_neurons   = NEURONS_PER_ENS,
+        dimensions  = NUM_DIMS,
+    )
+
+
+    # Neural adder to combine centre and spread*noise
+    candidate_vector = nengo.networks.EnsembleArray(
+        label           = "Candidate vector",
         n_neurons       = NEURONS_PER_DIM,
         n_ensembles     = NUM_DIMS,
         ens_dimensions  = 1,
-        radius          = 1.0,
-        # intercepts      = nengo.dists.Uniform(-0.99, 0.99),
-        # max_rates       = nengo.dists.Uniform(80,220),
-        # encoders        = nengo.dists.UniformHypersphere(surface=True),
-        # neuron_type     = nengo.LIF(),
-        # seed=SEED_VALUE,
-    )
-
-    # CENTRE and SPREAD Ensembles
-    centre_ens  = nengo.Ensemble(
-        label       = "Centre",
-        n_neurons   = NEURONS_PER_ENS + 20 * NUM_DIMS,
-        dimensions  = NUM_DIMS,
-        radius      = 1.5,
-    )
-    spread_ens = nengo.Ensemble(
-        label       = "Spread",
-        n_neurons   = NEURONS_PER_ENS + 20 * NUM_DIMS,
-        dimensions  = NUM_DIMS,
-        radius      = 1.5,
-    )
-
-    # COMPOSE NODE: Combine centre and spread into state vector
-    def compose_func(t, data):
-        perturbation    = data[:NUM_DIMS]
-        centre          = data[NUM_DIMS:2 * NUM_DIMS]
-        spread          = np.clip(data[2 * NUM_DIMS:], SPREAD_MIN, SPREAD_MAX)
-
-        return np.clip(centre + spread * perturbation, -1.0, 1.0)
-
-    compose_node = nengo.Node(
-        label       = "Composition",
-        size_in     = 3 * NUM_DIMS,
-        size_out    = NUM_DIMS,
-        output      = compose_func,
+        radius          = 1.5,
     )
 
     # OBJECTIVE FUNCTION NODE: Evaluate the objective function
@@ -131,6 +242,8 @@ with model:
         fv  = problem(x)
         return np.concatenate((v, [fv]))
 
+    state["best_f"] = objective_func(0.0, tro2s(X_INITIAL_GUESS, state["lb"], state["ub"]))[-1]
+
     obj_node = nengo.Node(
         label       = "Problem",
         output      = objective_func,
@@ -138,13 +251,11 @@ with model:
         size_out    = NUM_DIMS + NUM_OBJS,
     )
 
-    state["best_f"]     = objective_func(0.0, state["best_v"])[-1]
-
-
     # SELECTOR NODE: Keep track of best-so-far solution
     def selector_func(t, vf):
         v       = vf[:NUM_DIMS]
         fv      = float(vf[NUM_DIMS])
+        state["archive"].append((v.copy(), fv))
 
         # Update improvement metrics
         if state["best_f"] is None or (fv < state["best_f"]):
@@ -152,7 +263,6 @@ with model:
             state["best_f"]         = fv
 
             state["best_v"]         = v.copy()
-            state["best_x"]         = trs2o(state["best_v"], state["lb"], state["ub"])
 
             state["t_last_improv"]   = t
             # state["archive"].append((state["best_v"], state["best_f"]))
@@ -167,112 +277,65 @@ with model:
         size_out    = NUM_DIMS + NUM_OBJS,
     )
 
-    # FEATURES NODE: Extract features for utility computation
-    def features_func(t, vf):
-        # Update archive with current sample
-        v       = vf[:NUM_DIMS]
-        fv      = float(vf[NUM_DIMS:NUM_DIMS + NUM_OBJS])
+    # FEATURES ENSEMBLE: Extract features from the current evaluation
 
-        # Update the current features based on improvement and stagnation
+    # Input to the neuromodulator, instantaneous signals
+    def improv_input_func(t):
         if state["prev_best_f"] is None:
-            state["prev_best_f"]    = state["best_f"]
+            state["prev_best_f"] = state["best_f"]
+            return 0.0
+        difff   = max(0.0, state["prev_best_f"] - state["best_f"])
+        denom   = abs(state["prev_best_f"]) + EPS
+        return np.clip(difff / denom, 0.0, 1.0)
 
-        difff       = max(0.0, state["prev_best_f"] - state["best_f"])
-        denom       = EPS + abs(state["prev_best_f"])
-        improv      = difff / denom
-
-        smi, sgd = state["curr_features"]
-
-        sgd         = np.clip((t - state["t_last_improv"]) / STAG_WAIT, 0.0, 1.0)
-        smi         = np.clip(ALPHA_IMPROV * smi + (1 - ALPHA_IMPROV) * improv, 0.0, 1.0)
-
-        # If it is in stagnation, we consider the sampling is over, so we update other features
-        if sgd >= 1.0:
-            state["sampling_stage"]     = True
-            state["archive"].append((v.copy(), fv))
-        else:
-            state["sampling_stage"]     = False
-            state["archive_sorted"]     = sorted(state["archive"], key=lambda item: item[1])
-
-        state["curr_features"]      = np.array([smi, sgd], dtype=float)
-
-        return state["curr_features"]
-
-    # Features node to extract features for utility computation
-    features_node = nengo.Node(
-        label       = "features",
-        output      = features_func,
-        size_in     = NUM_DIMS + NUM_OBJS,
-        size_out    = NUM_FEATURES,
+    improv_input_node = nengo.Node(
+        label       = "Improvement",
+        output      = improv_input_func,
+        size_out    = 1,
     )
 
-    # CENTRE CONTROLLER NODE: Compute centre based on features
-    def centre_control(t, x):
-        smi, sgd = x
+    def movement_input_func(t):
+        if state["prev_best_v"] is None:
+            state["prev_best_v"] = state["best_v"].copy()
+        diffv   = float(np.linalg.norm(state["prev_best_v"] - state["best_v"]))
+        state["prev_best_v"] = state["best_v"].copy()
+        return diffv
 
-        if state["archive"]:
-            A        = list(state["archive"])
-            A_sorted = sorted(A, key=lambda item: item[1])
-            mu       = max(1, min(MU, len(A_sorted)//2))
-            v_bar    = np.mean([v for v, _ in A_sorted[:mu]], axis=0)
-        else:
-            v_bar    = best_v
-
-        return v_bar
-
-    centre_ctrl_node = nengo.Node(
-        label       = "Centre Control",
-        size_in     = NUM_FEATURES,
-        size_out    = NUM_DIMS,
-        output      = centre_control,
+    movement_input_node = nengo.Node(
+        label       = "Movement",
+        output      = movement_input_func,
+        size_out    = 1,
     )
 
-    # SPREAD CONTROLLER NODE: Compute spread based on features
-    def spread_control(t, x):
-        smi, sgd = x
+    # Adaptive threshold
+    def _gate(_x, k = 0.5):
+        _m_val                      = _x[0]
+        state["smoothed_improv"]    = ALPHA_IMPROV * state["smoothed_improv"] + (1 - ALPHA_IMPROV) * _m_val
+        _thresh                     = max(THRESHOLD_V, k * state["smoothed_improv"])
+        return np.array([np.clip(1.0 - _m_val / (_thresh + EPS), 0.0, 1.0)])
 
-        # Anisotropic sigma: each dimension gets its own value based on features
-        # Example: modulate sigma by SMI and SGD for each dimension
-        s_star = np.clip(sigma * (1.0 + 0.5 * smi + 0.5 * sgd * np.arange(NUM_DIMS) / max(1, NUM_DIMS - 1)),
-                         SPREAD_MIN, SPREAD_MAX)
-        return s_star
 
-    spread_ctrl_node = nengo.Node(
-        label       = "Spread Control",
-        size_in     = NUM_FEATURES,
-        size_out    = NUM_DIMS,
-        output      = spread_control,
+    # Features ensemble to extract features for utility computation
+    neuromodulator_ens = nengo.Ensemble(
+        label       = "Neuromodulator",
+        n_neurons   = NEURONS_PER_ENS,
+        dimensions  = NUM_FEATURES,
+        radius      = 1.0,
     )
 
-    # PERTURBATION CONTROLLER NODE: Compute perturbation based on features
-    def perturbation_control(t, u):
-        return np.random.normal(0.0, 1.0, size=NUM_DIMS)
-
-    perturb_ctrl_node = nengo.Node(
-        label       = "Perturbation Control",
-        size_in     = NUM_DIMS,
-        size_out    = NUM_DIMS,
-        output      = perturbation_control,
+    stagnation_gate = nengo.Ensemble(
+        label       = "Stagnation Gate",
+        n_neurons   = NEURONS_PER_ENS,
+        dimensions  = 1,
     )
 
-    # PULSER NODE: Clock signal to trigger new proposals
-    # Pulser function to inject the initial guess at t=0 and best_v after shrinks
-    def pulser_func(t):
-        return state["best_v"] if t < 1e-3 else np.random.normal(0.0, 0.1, NUM_DIMS)
-
-    # Pulser node to trigger actions
-    pulser_node = nengo.Node(
-        label       = "Trigger",
-        output      = pulser_func,
-        size_out    = NUM_DIMS,
-    )
 
     # TODO: this could be a memory
     # [Aux] Nodes to extract only fbest and xbest from the selector output
     fbest_only = nengo.Node(
         size_in     =NUM_DIMS + NUM_OBJS,
         size_out    = 1,
-        output      = lambda t, x: x[-1]
+        output      = lambda t, _x: _x[-1]
     )
     xbest_only = nengo.Node(
         size_in     =NUM_DIMS + NUM_OBJS,
@@ -280,49 +343,93 @@ with model:
         output      = lambda t, x: trs2o(x[:NUM_DIMS], state["lb"], state["ub"])
     )
 
-    # CONNECTIONS
+    # INITIALISATION CONNECTIONS
     # --------------------------------------------------------------
+    nengo.Connection(init_centre, motor_centre, synapse=TAU_0)
+    nengo.Connection(init_spread, motor_logsigma, synapse=TAU_0)
 
-    # Motor loop
-    nengo.Connection(pulser_node,       motor.input,                                    synapse=None)
-    nengo.Connection(motor.output, perturb_ctrl_node, synapse=None)
-    nengo.Connection(perturb_ctrl_node, motor.input, synapse=TAU)
+    # CENTRE CONTROL LOOP
+    # --------------------------------------------------------------
+    # Error: centroid - centre
+    nengo.Connection(centroid_node, error_centre, synapse=None, transform=np.eye(NUM_DIMS))
+    nengo.Connection(motor_centre, error_centre, synapse=None, transform=-np.eye(NUM_DIMS))
 
-    # Composition of centre, spread, and perturbation
-    nengo.Connection(motor.output, compose_node[:NUM_DIMS], synapse=None)
-    nengo.Connection(centre_ens, compose_node[NUM_DIMS:2 * NUM_DIMS], synapse=TAU)
-    nengo.Connection(spread_ens, compose_node[2 * NUM_DIMS:], synapse=TAU)
+    # Gain modulation
+    nengo.Connection(error_centre, gain_product.A, synapse=TAU_1)
+    # nengo.Connection(neuromodulator_ens[0], gain_product.B, synapse=TAU_1, transform=GAIN_1 * np.ones((NUM_DIMS, 1)))
+    nengo.Connection(gain_bias, gain_product.B, synapse=None, transform=GAIN_2 * np.eye(NUM_DIMS))
 
-    # Environment evaluation
-    nengo.Connection(compose_node,              obj_node,                                       synapse=None)
-    nengo.Connection(obj_node,                  selector_node,                                  synapse=None)
-    nengo.Connection(obj_node,                  features_node,                                  synapse=None)
+    # Centre integrator and update
+    nengo.Connection(motor_centre, motor_centre, synapse=TAU_3, transform=np.eye(NUM_DIMS))
+    nengo.Connection(gain_product.output, motor_centre, synapse=TAU_3)
 
-    # Centre control
-    nengo.Connection(features_node, centre_ctrl_node, synapse=TAU)
-    nengo.Connection(centre_ctrl_node, centre_ens, synapse=None)
-    # nengo.Connection(centre_ens, centre_ens, synapse=TAU, transform=0.95*np.eye(NUM_DIMS))
+    # SPREAD CONTROL LOOP
+    # --------------------------------------------------------------
+    # Leaky integrator
+    nengo.Connection(motor_logsigma, motor_logsigma, synapse=TAU_3, transform=LEAK * np.eye(NUM_DIMS))
 
-    # Spread control
-    nengo.Connection(features_node, spread_ctrl_node, synapse=TAU)
-    nengo.Connection(spread_ctrl_node, spread_ens, synapse=None)
-    # nengo.Connection(spread_ens, spread_ens, synapse=TAU, transform=0.95*np.eye(NUM_DIMS))
+    # Shrink (stagnation-driven)
+    # nengo.Connection(motor_logsigma, shrink_gate.A, synapse=TAU_1)
+    nengo.Connection(gain_bias, shrink_gate.A, synapse=None, transform=GAIN_2 * np.eye(NUM_DIMS))
+    nengo.Connection(neuromodulator_ens[1], shrink_gate.B, synapse=TAU_1, transform=ETA_S * np.ones((NUM_DIMS, 1)))
+    nengo.Connection(shrink_gate.output, motor_logsigma, synapse=TAU_3, transform=-np.eye(NUM_DIMS))
 
-    # Outputs
+    # Grow (improvement-driven)
+    # nengo.Connection(motor_logsigma, grow_gate.A, synapse=TAU_1)
+    nengo.Connection(gain_bias, grow_gate.A, synapse=None, transform=GAIN_2 * np.eye(NUM_DIMS))
+    nengo.Connection(neuromodulator_ens[0], grow_gate.B, synapse=TAU_1, transform=ETA_G * np.ones((NUM_DIMS, 1)))
+    nengo.Connection(grow_gate.output, motor_logsigma, synapse=TAU_3, transform=np.eye(NUM_DIMS))
+
+    # Inhibit grow when stagnating
+    # nengo.Connection(neuromodulator_ens[1], inhibit_grow, synapse=TAU_1)
+    # nengo.Connection(inhibit_grow, grow_gate.B, synapse=None)
+
+    # Inhibit shrink when improving
+    # nengo.Connection(neuromodulator_ens[0], inhibit_shrink, synapse=TAU_1)
+    # nengo.Connection(inhibit_shrink, shrink_gate.B, synapse=None)
+
+    # Clamp spread to valid range
+    nengo.Connection(motor_logsigma, clamp_spread, synapse=TAU_1)
+
+    # CANDIDATE GENERATION
+    # --------------------------------------------------------------
+    # Noise and scale
+    nengo.Connection(noise_node, motor_noise, synapse=TAU_1)
+    # nengo.Connection(motor_logsigma, mult_spread_noise.A, synapse=TAU_2)
+    nengo.Connection(clamp_spread, mult_spread_noise.A, synapse=TAU_2)
+    nengo.Connection(motor_noise, mult_spread_noise.B, synapse=TAU_2)
+
+    # Compose candidate
+    nengo.Connection(motor_centre, candidate_vector.input, synapse=TAU_2)
+    nengo.Connection(mult_spread_noise.output, candidate_vector.input, synapse=TAU_2)
+
+    # EVALUATION AND SELECTION
+    # --------------------------------------------------------------
+    nengo.Connection(candidate_vector.output, obj_node, synapse=None)
+    nengo.Connection(obj_node, selector_node, synapse=None)
+
+    # NEUROMODULATION (FEATURE INPUTS)
+    # --------------------------------------------------------------
+    nengo.Connection(improv_input_node, neuromodulator_ens[0], synapse=TAU_2)
+    nengo.Connection(movement_input_node, stagnation_gate, synapse=TAU_2, function=_gate)
+    nengo.Connection(stagnation_gate, neuromodulator_ens[1], synapse=TAU_1)
+
+    # OUTPUTS
+    # --------------------------------------------------------------
     nengo.Connection(selector_node, fbest_only, synapse=None)
     nengo.Connection(selector_node, xbest_only, synapse=None)
 
     # PROBES
     # --------------------------------------------------------------
-    ens_lif_val     = nengo.Probe(motor.output, synapse=0.01)  # 10ms filter
+    # ens_lif_val     = nengo.Probe(motor.output, synapse=0.01)  # 10ms filter
     obj_val         = nengo.Probe(obj_node[-1], synapse=0)
     fbest_val       = nengo.Probe(fbest_only, synapse=0.01)
     xbest_val       = nengo.Probe(xbest_only, synapse=0.01)
-    ea_spk          = [nengo.Probe(ens.neurons, synapse=0.01) for ens in motor.ensembles]
+    # ea_spk          = [nengo.Probe(ens.neurons, synapse=0.01) for ens in motor.ensembles]
 
-    centre_val      = nengo.Probe(centre_ctrl_node, synapse=0.01)
-    spread_val      = nengo.Probe(spread_ctrl_node, synapse=0.01)
-    features_val    = nengo.Probe(features_node, synapse=0.01)
+    centre_val      = nengo.Probe(motor_centre,         synapse=0.01)
+    spread_val      = nengo.Probe(motor_logsigma, synapse=0.01)
+    features_val    = nengo.Probe(neuromodulator_ens,   synapse=0.01)
 
     # utility_vals    = nengo.Probe(utility_ens, synapse=0.01)
 
@@ -380,7 +487,7 @@ plt.legend(loc="lower left")
 
 ax2 = ax1.twinx()
 ax2.plot(sim.trange(), np.average(sim.data[centre_val], axis=1), "g--", label="Centre")
-ax2.plot(sim.trange(), np.average(sim.data[spread_val], axis=1), "m--", label="Spread")
+ax2.plot(sim.trange(), np.exp(np.average(sim.data[spread_val], axis=1)), "m--", label="Spread")
 ax2.plot(sim.trange(), sim.data[features_val][:,0], "c:", label="SMI")
 ax2.plot(sim.trange(), sim.data[features_val][:,1], "y:", label="SGD")
 ax2.set_ylabel("Centre / Spread values")
