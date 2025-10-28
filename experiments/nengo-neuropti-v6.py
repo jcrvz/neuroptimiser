@@ -1,9 +1,6 @@
 #%%
-import secrets
-
 import matplotlib.pyplot as plt
 import nengo
-from collections import deque
 from sortedcontainers import SortedList
 import numpy as np
 from ioh import get_problem
@@ -21,7 +18,7 @@ NUM_DIMS        = 2  # Number of dimensions for the problem
 
 NEURONS_PER_DIM = 20 * NUM_DIMS
 NEURONS_PER_ENS = 100
-SIMULATION_TIME = 50.0  # seconds
+SIMULATION_TIME = 100.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMS)
 problem.reset()
@@ -30,6 +27,12 @@ print(problem)
 X_LOWER_BOUND   = problem.bounds.lb
 X_UPPER_BOUND   = problem.bounds.ub
 X_INITIAL_GUESS = np.random.uniform(X_LOWER_BOUND, X_UPPER_BOUND, NUM_DIMS)
+
+def eval_obj_func(v_scaled):
+    # Transform from scaled to original
+    x_orig  = trs2o(v_scaled, X_LOWER_BOUND, X_UPPER_BOUND)
+    f_val   = problem(x_orig)
+    return f_val
 
 # Keep copies of the original global bounds
 X_LOWER_BOUND0  = X_LOWER_BOUND.copy()
@@ -58,8 +61,8 @@ _DENOM         = np.sqrt(max(3, NUM_DIMS))
 GAIN_1         = 5.0 / _DENOM
 GAIN_2         = 1.0 / (0.5 * GAIN_1)
 GAIN_CENTRE    = 5.0
-ETA_S          = 0.3 / _DENOM
-ETA_G          = 0.2 / _DENOM
+ETA_S          = 1.0
+ETA_G          = 1.0
 
 #%%
 
@@ -115,29 +118,37 @@ with model:
         size_out    = NUM_DIMS,
     )
 
-    # Centre control
-    def centroid_func(t):
-        if state["archive"]:
-            mu      = max(1, min(MU, len(state["archive"]) // 2))
-            elite   = np.array([v for v,_ in state["archive"][:mu]])
-            ranks   = np.arange(1, mu+1)
-            weights = np.log(mu + 0.5) - np.log(ranks)
-            weights /= np.sum(weights)
-            return weights @ elite
-        return state["best_v"]
+    # Centre target node
+    def centre_target_func(t, features):
+        if not state["archive"]:
+            return state["best_v"]
 
-    centroid_node = nengo.Node(
-        label       = "EW Centroid",
-        output      = centroid_func,
+        # Get the features
+        success_rate, improv_rate   = features
+
+        # Compute the centroid of the top-mu solutions
+        mu          = max(2, min(MU, len(state["archive"]) // 2))
+        elite       = np.array([v for v,_ in state["archive"][:mu]])
+        ranks       = np.arange(1, len(elite) + 1)
+        weights     = np.log(mu + 0.5) - np.log(ranks)
+        weights     /= np.sum(weights)
+        centroid    = weights @ elite
+
+        # Blend between best-so-far and centroid based on success rate
+        return improv_rate * state["best_v"] + (1.0 - improv_rate) * centroid
+
+    centre_target_node = nengo.Node(
+        label       = "Centre Target",
+        output      = centre_target_func,
+        size_in     = NUM_FEATURES,
         size_out    = NUM_DIMS,
     )
 
-    # Error ensemble to compute error between best and centroid
-    error_centre = nengo.Ensemble(
-        label           = "Centre Error",
-        n_neurons       = NEURONS_PER_ENS + 10 * NUM_DIMS,
-        dimensions      = NUM_DIMS,
-        radius          = 2.0,
+    # CENTRE CONTROL LOOP
+    centre_control = nengo.networks.Product(
+        label       = "Centre Control",
+        n_neurons   = NEURONS_PER_ENS,
+        dimensions  = NUM_DIMS,
     )
 
     # CENTRE Ensemble and control
@@ -197,8 +208,7 @@ with model:
     # OBJECTIVE FUNCTION NODE: Evaluate the objective function
     def objective_func(t, variables):
         v   = np.clip(variables, -1.0, 1.0)
-        x   = np.array(trs2o(v, state["lb"], state["ub"]))
-        fv  = problem(x)
+        fv  = eval_obj_func(v)
         return np.concatenate((v, [fv]))
 
     state["best_f"] = objective_func(0.0, tro2s(X_INITIAL_GUESS, state["lb"], state["ub"]))[-1]
@@ -298,20 +308,6 @@ with model:
         radius      = 1.0,
     )
 
-
-    # TODO: this could be a memory
-    # [Aux] Nodes to extract only fbest and xbest from the selector output
-    fbest_only = nengo.Node(
-        size_in     =NUM_DIMS + NUM_OBJS,
-        size_out    = 1,
-        output      = lambda t, _x: _x[-1]
-    )
-    xbest_only = nengo.Node(
-        size_in     =NUM_DIMS + NUM_OBJS,
-        size_out    = NUM_DIMS,
-        output      = lambda t, x: trs2o(x[:NUM_DIMS], state["lb"], state["ub"])
-    )
-
     # INITIALISATION CONNECTIONS
     # --------------------------------------------------------------
     nengo.Connection(init_centre, motor_centre, synapse=TAU_0)
@@ -319,13 +315,15 @@ with model:
 
     # CENTRE CONTROL LOOP
     # --------------------------------------------------------------
-    # Error: centroid - centre
-    nengo.Connection(centroid_node, error_centre, synapse=None, transform=np.eye(NUM_DIMS))
-    nengo.Connection(motor_centre, error_centre, synapse=None, transform=-np.eye(NUM_DIMS))
+    # Compute error between target and current centre
+    nengo.Connection(neuromodulator_ens, centre_target_node, synapse=TAU_0)
+    nengo.Connection(centre_target_node, centre_control.A, synapse=TAU_1, transform=GAIN_CENTRE * np.eye(NUM_DIMS))
+    nengo.Connection(neuromodulator_ens[0], centre_control.B, synapse=TAU_1, transform=np.ones((NUM_DIMS, 1)))
 
     # Centre integrator and update
-    nengo.Connection(motor_centre, motor_centre, synapse=TAU_3, transform=0.9 * np.eye(NUM_DIMS))
-    nengo.Connection(error_centre, motor_centre, synapse=TAU_3, transform=GAIN_CENTRE * np.eye(NUM_DIMS))
+    nengo.Connection(motor_centre, motor_centre, synapse=TAU_1, transform=0.9 * np.eye(NUM_DIMS))
+    nengo.Connection(centre_control.output, motor_centre, synapse=TAU_1, transform=np.eye(NUM_DIMS))
+    # nengo.Connection(selector_node[:NUM_DIMS], motor_centre, synapse=0.01, transform=GAIN_CENTRE * np.eye(NUM_DIMS))
 
     # SPREAD CONTROL LOOP
     # --------------------------------------------------------------
@@ -366,15 +364,15 @@ with model:
 
     # OUTPUTS
     # --------------------------------------------------------------
-    nengo.Connection(selector_node, fbest_only, synapse=None)
-    nengo.Connection(selector_node, xbest_only, synapse=None)
+    # nengo.Connection(selector_node, fbest_only, synapse=None)
+    # nengo.Connection(selector_node, xbest_only, synapse=None)
 
     # PROBES
     # --------------------------------------------------------------
     # ens_lif_val     = nengo.Probe(motor.output, synapse=0.01)  # 10ms filter
     obj_val         = nengo.Probe(obj_node[-1], synapse=0)
-    fbest_val       = nengo.Probe(fbest_only, synapse=0.01)
-    xbest_val       = nengo.Probe(xbest_only, synapse=0.01)
+    fbest_val       = nengo.Probe(selector_node[-1], synapse=0.01)
+    vbest_val       = nengo.Probe(selector_node[:NUM_DIMS], synapse=0.01)
     # ea_spk          = [nengo.Probe(ens.neurons, synapse=0.01) for ens in motor.ensembles]
 
     centre_val      = nengo.Probe(motor_centre,         synapse=0.01)
@@ -390,19 +388,23 @@ with nengo.Simulator(model) as sim:
     # Run it for 1 second
     sim.run(SIMULATION_TIME)
 
-
-
 #%%
 print("Evals", len(sim.data[obj_val]))
 print(f"{'xid':3s}: {'lower':>8s} {'upper':>8s}, {'xbest':>8s} :: {'xopt':>7s} | {'diff':>7s}")
 print("-" * 55)
+
+vbest_values    = sim.data[vbest_val]
+
+xbest   = np.array([trs2o(vbest_values[i,:], X_LOWER_BOUND0, X_UPPER_BOUND0) for i in range(vbest_values.shape[0])])
+
+
 for i in range(NUM_DIMS):
-    print(f" x{i+1:02d}: [{np.min(sim.data[xbest_val][:,i]):.4f}, {np.max(sim.data[xbest_val][:,i]):.4f}], ", end="")
-    print(f"{sim.data[xbest_val][-1][i]:7.4f} :: {problem.optimum.x[i]:7.4f} | {sim.data[xbest_val][-1][i] - problem.optimum.x[i]:7.4f}")
+    print(f" x{i+1:02d}: [{np.min(xbest[:,i]):.4f}, {np.max(xbest[:,i]):.4f}], ", end="")
+    print(f"{xbest[-1,i]:7.4f} :: {problem.optimum.x[i]:7.4f} | {xbest[-1,i] - problem.optimum.x[i]:7.4f}")
 
 print(f"fbest: {sim.data[fbest_val][-1][0]:.4f} (opt: {problem.optimum.y}), diff: {sim.data[fbest_val][-1][0] - problem.optimum.y:.4f}")
 #%%
-x = sim.data[xbest_val][-1]
+x = xbest[-1, :]
 f = problem(x)
 print(f"f(xbest): {f:.4f} (opt: {problem.optimum.y}), diff: {f - problem.optimum.y:.4f}")
 
@@ -422,10 +424,17 @@ print(f"f(xbest): {f:.4f} (opt: {problem.optimum.y}), diff: {f - problem.optimum
 #%%
 plt.figure(figsize=(12, 8), dpi=150)
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, 1e0, 1e9, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
-plt.plot(sim.trange(), sim.data[obj_val] - problem.optimum.y, label="Objective value error")
+plt.plot(sim.trange(), sim.data[obj_val] - problem.optimum.y, label="Objective value error", alpha=0.3)
 plt.plot(sim.trange(), sim.data[fbest_val] - problem.optimum.y, label="Best-so-far error")
 # plt.hlines(problem.optimum.y, 0, simulation_time, colors="r", linestyles="dashed", label="Optimal value")
 # plt.plot(sim.trange(), sim.data[fbest_val] - problem.optimum.y, label="Best-so-far diff") #"Best-so-far value")
+
+centre_scaled = np.clip(sim.data[centre_val], -1.0, 1.0)
+f_centre = np.array([eval_obj_func(centre_scaled[i,:]) for i in range(centre_scaled.shape[0])])
+
+plt.plot(sim.trange(), f_centre - problem.optimum.y, "g,", alpha=0.5)
+f_centre_smooth = np.convolve(f_centre, np.ones(100)/100, mode='same')
+plt.plot(sim.trange(), f_centre_smooth - problem.optimum.y, "g--", label="Centre error")
 
 # add second axis for centre and spread
 ax1 = plt.gca()
@@ -436,11 +445,18 @@ plt.yscale("log")
 plt.legend(loc="lower left")
 
 ax2 = ax1.twinx()
-ax2.plot(sim.trange(), np.average(sim.data[centre_val], axis=1), "g--", label="Centre")
-ax2.plot(sim.trange(), np.exp(np.average(sim.data[spread_val], axis=1)), "m--", label="Spread")
-ax2.plot(sim.trange(), sim.data[features_val][:,0], "c:", label="SMI")
-ax2.plot(sim.trange(), sim.data[features_val][:,1], "y:", label="SGD")
-ax2.set_ylabel("Centre / Spread values")
+# ax2.plot(sim.trange(), np.average(sim.data[centre_val], axis=1), "g--", label="Centre")
+# ax2.plot(sim.trange(), np.exp(np.average(sim.data[spread_val], axis=1)), "m--", label="Spread")
+
+improv_rate = sim.data[features_val][:,0]
+succes_rate = sim.data[features_val][:,1]
+ax2.plot(sim.trange(), improv_rate, "c,", alpha=0.75)
+ax2.plot(sim.trange(), np.convolve(improv_rate, np.ones(100)/100, mode='same'), "c--", label="Succ. Rate")
+ax2.plot(sim.trange(), succes_rate, "y,", alpha=0.75)
+ax2.plot(sim.trange(), np.convolve(succes_rate, np.ones(100)/100, mode='same'), "y--", label="Impv. Rate")
+
+
+ax2.set_ylabel("Feature value")
 ax2.set_yscale("linear")
 ax2.legend(loc="upper right")
 
@@ -451,14 +467,40 @@ plt.show()
 #%%
 # Plot the decoded output of the ensemble
 plt.figure(figsize=(12, 8), dpi=150)
+ax1 = plt.gca()
 # plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -5, 5, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
-plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
+plt.plot(sim.trange(), xbest, label=[f"x{i + 1}" for i in range(NUM_DIMS)])
+
+for i in range(NUM_DIMS):
+    plt.hlines(problem.optimum.x[i], 0, SIMULATION_TIME, colors="k", linestyles="dashed", label=f"xopt" if i==0 else None)
+
 # plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
 plt.xlim(0, SIMULATION_TIME)
 plt.xlabel("Time, s")
 plt.ylabel(r"$x_{best}$ values")
-plt.legend()
+
+ax2 = ax1.twinx()
+
+# Color lines for each dimension
+colors_1 = plt.cm.rainbow(np.linspace(0, 1, NUM_DIMS))
+# colors_2 = plt.cm.vanimo(np.linspace(0, 1, NUM_DIMS))
+num_samples = sim.data[centre_val].shape[0]
+every_n = max(1, num_samples // 50)
+for i in range(NUM_DIMS):
+    ax2.plot(sim.trange(), sim.data[centre_val][:, i], color=colors_1[i], linestyle="", marker=",", alpha=0.5,)
+    ax2.plot(sim.trange(), np.convolve(sim.data[centre_val][:,i], np.ones(100)/100, mode='same'), alpha=0.5,
+             color=colors_1[i], linestyle="dashed", marker="o", markevery=every_n, label=f"Centre dim {i+1}")
+    ax2.plot(sim.trange(), sim.data[spread_val][:, i], color=colors_1[i], linestyle="", marker=",", alpha=0.5, )
+    ax2.plot(sim.trange(), np.convolve(sim.data[spread_val][:,i], np.ones(100)/100, mode='same'), alpha=0.5,
+             color=colors_1[i], linestyle="dashed", marker="x", markevery=every_n, label=f"Spread dim {i + 1}")
+
+ax2.set_ylabel("Centre and Spread")
+ax2.set_yscale("linear")
+
+ax1.legend(loc="upper left", framealpha=0.9)
+ax2.legend(loc="upper right", framealpha=0.9)
+
 plt.show()
 
 #%%
