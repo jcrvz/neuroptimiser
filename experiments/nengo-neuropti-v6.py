@@ -1,10 +1,10 @@
 #%%
 import secrets
-from pyexpat import features
 
 import matplotlib.pyplot as plt
 import nengo
 from collections import deque
+from sortedcontainers import SortedList
 import numpy as np
 from ioh import get_problem
 from nengo.utils.matplotlib import rasterplot, implot
@@ -19,8 +19,8 @@ PROBLEM_INS     = 1  # Problem instance
 NUM_OBJS        = 1   # Number of objectives (only single-objective supported here)
 NUM_DIMS        = 2  # Number of dimensions for the problem
 
-NEURONS_PER_DIM = 100
-NEURONS_PER_ENS = 200
+NEURONS_PER_DIM = 20 * NUM_DIMS
+NEURONS_PER_ENS = 100
 SIMULATION_TIME = 50.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMS)
@@ -43,28 +43,21 @@ STAG_WAIT       = 3.0
 ALPHA_IMPROV    = 0.20
 EPS             = 1e-12
 
-TAU_0 = TAU_1 = TAU_2 = TAU_3 = 0.01
-# TAU_0           = 0.01
-# TAU_1           = 0.01
-# TAU_2           = 0.02
-# TAU_3           = 0.03
+TAU_0 = TAU_1 = TAU_2 = 0.005
+TAU_3           = 0.01
 LEAK            = 1.0
 
-LAMBDA          = 64
-MU              = max(1, LAMBDA // 4)
-SIGMA_MIN       = 1e-6
-SIGMA_MAX       = 0.25
+LAMBDA          = 100
+MU              = max(4, LAMBDA // 2)
 SPREAD_MIN      = 1e-6
-SPREAD_MAX      = 1.0
-D_EFF           = max(3, NUM_DIMS // 3)
-PSUCC_TARGET    = 0.2
-PSUCC_WINDOW    = 1.5
+SPREAD_MAX      = 0.5
 
 THRESHOLD_V    = 1e-3
 
 _DENOM         = np.sqrt(max(3, NUM_DIMS))
 GAIN_1         = 5.0 / _DENOM
 GAIN_2         = 1.0 / (0.5 * GAIN_1)
+GAIN_CENTRE    = 5.0
 ETA_S          = 0.3 / _DENOM
 ETA_G          = 0.2 / _DENOM
 
@@ -85,12 +78,8 @@ with model:
         "prev_best_f":      None,                   # previous best objective value
         "smoothed_improv":  1.0,                    # smoothed improvement metric
         "t_last_improv":    0.0,                    # time when stagnation started
-        "curr_features":    np.array([1.0, 0.0]),   # [smi, sgd]
-        "archive":          deque(maxlen=LAMBDA),       # small archive to represent the sampling phase
-        # "archive_sorted":   None,                 # sorted archive
-        "sampling_stage":   True,                 # whether we are in sampling stage
+        "archive":          SortedList(key=lambda _x: _x[1]),       # small archive to represent the sampling phase
         "sigma":            0.25,                    # current spread value
-        "flip":             1.0,
     }
 
     # DEFINE THE MAIN COMPONENTS
@@ -99,8 +88,7 @@ with model:
     # NOISE SOURCE: Generates perturbations
     def noise_func(t):
         _z  = np.random.normal(0.0, 1.0, NUM_DIMS)
-        state["flip"] *= -1.0
-        return state["flip"] * np.clip(_z, -3.0, 3.0)
+        return np.clip(_z, -3.0, 3.0)
 
     noise_node = nengo.Node(
         label       = "Noise Source",
@@ -130,9 +118,8 @@ with model:
     # Centre control
     def centroid_func(t):
         if state["archive"]:
-            A       = sorted(state["archive"], key=lambda _x: _x[1])  # sort by fitness
-            mu      = max(1, min(MU, len(A)//2))
-            elite   = np.array([v for v,_ in A[:mu]])
+            mu      = max(1, min(MU, len(state["archive"]) // 2))
+            elite   = np.array([v for v,_ in state["archive"][:mu]])
             ranks   = np.arange(1, mu+1)
             weights = np.log(mu + 0.5) - np.log(ranks)
             weights /= np.sum(weights)
@@ -162,11 +149,6 @@ with model:
     )
 
     # Scalar gain
-    gain_product    = nengo.networks.Product(
-        label       = "Gain Product",
-        n_neurons   = NEURONS_PER_ENS,
-        dimensions  = NUM_DIMS,
-    )
 
     gain_bias = nengo.Node(
         label       = "Gain Bias",
@@ -179,14 +161,6 @@ with model:
         n_neurons       = NEURONS_PER_DIM,
         dimensions      = NUM_DIMS,
         radius          = 1.5,
-    )
-
-    # Clamp spread to [SPREAD_MIN, SPREAD_MAX]
-    clamp_spread = nengo.Node(
-        label       = "Clamp Spread",
-        size_in     = NUM_DIMS,
-        size_out    = NUM_DIMS,
-        output      = lambda t, _x: np.clip(np.exp(_x), SPREAD_MIN, SPREAD_MAX),
     )
 
     # Shrink when stagnation is detected
@@ -202,21 +176,6 @@ with model:
         n_neurons   = NEURONS_PER_ENS,
         dimensions  = NUM_DIMS,
     )
-
-    # inhibit_grow = nengo.Node(
-    #     label       = "Inhibit Grow",
-    #     size_in     = 1,
-    #     size_out    = NUM_DIMS,
-    #     output      = lambda t, x: -x[0] * np.ones(NUM_DIMS),
-    # )
-    #
-    # inhibit_shrink = nengo.Node(
-    #     label       = "Inhibit Shrink",
-    #     size_in     = 1,
-    #     size_out    = NUM_DIMS,
-    #     output      = lambda t, x: -x[0] * np.ones(NUM_DIMS),
-    # )
-
 
     # COMPOSE NODE: Combine centre and spread into state vector
     mult_spread_noise   = nengo.networks.Product(
@@ -253,9 +212,16 @@ with model:
 
     # SELECTOR NODE: Keep track of best-so-far solution
     def selector_func(t, vf):
+        # Extract candidate solution and its objective value
         v       = vf[:NUM_DIMS]
         fv      = float(vf[NUM_DIMS])
-        state["archive"].append((v.copy(), fv))
+
+        # Archive update
+        state["archive"].add((v.copy(), fv))
+
+        # Keep archive size limited
+        if len(state["archive"]) > LAMBDA:
+            state["archive"].pop()
 
         # Update improvement metrics
         if state["best_f"] is None or (fv < state["best_f"]):
@@ -265,8 +231,6 @@ with model:
             state["best_v"]         = v.copy()
 
             state["t_last_improv"]   = t
-            # state["archive"].append((state["best_v"], state["best_f"]))
-
 
         return np.concatenate((state["best_v"], [state["best_f"]]))
 
@@ -279,41 +243,52 @@ with model:
 
     # FEATURES ENSEMBLE: Extract features from the current evaluation
 
-    # Input to the neuromodulator, instantaneous signals
-    def improv_input_func(t):
-        if state["prev_best_f"] is None:
-            state["prev_best_f"] = state["best_f"]
+    def _feat_success_rate(t):
+        if len(state["archive"]) < 2:
+            return 0.5
+
+        f_values = [fv for _, fv in state["archive"]]
+        median_f = np.median(f_values)
+        num_success = np.sum(f_values < median_f)
+        return num_success / len(f_values)
+
+    def _feat_fitness_diversity(t):
+        if len(state["archive"]) < 2:
             return 0.0
-        difff   = max(0.0, state["prev_best_f"] - state["best_f"])
-        denom   = abs(state["prev_best_f"]) + EPS
-        return np.clip(difff / denom, 0.0, 1.0)
 
-    improv_input_node = nengo.Node(
-        label       = "Improvement",
-        output      = improv_input_func,
-        size_out    = 1,
+        mu      = max(2, min(MU, len(state["archive"]) // 2))
+        elite_f = [fv for _, fv in state["archive"][:mu]]
+
+        std_eli = np.std(elite_f)
+        mean_eli= np.mean(elite_f) + EPS
+
+        return std_eli / mean_eli
+
+    def _improvement_rate(t):
+        if state["prev_best_f"] is None:
+            return 0.0
+
+        delta_f     = max(0.0, state["prev_best_f"] - state["best_f"])
+        rel_improv  = delta_f / (abs(state["prev_best_f"]) + EPS)
+
+        time_since  = max(EPS, t - state["t_last_improv"])
+        decay       = np.exp(-time_since / STAG_WAIT)
+        return rel_improv * decay
+
+    # Features input node
+    def features_input_func(t):
+        features = []
+        for _feat in [_feat_success_rate, _improvement_rate]:
+            feat_val = _feat(t)
+            features.append(feat_val)
+
+        return np.clip(features, 0.0, 1.0)
+
+    features_input_node = nengo.Node(
+        label       = "Features Input",
+        output      = features_input_func,
+        size_out    = NUM_FEATURES,
     )
-
-    def movement_input_func(t):
-        if state["prev_best_v"] is None:
-            state["prev_best_v"] = state["best_v"].copy()
-        diffv   = float(np.linalg.norm(state["prev_best_v"] - state["best_v"]))
-        state["prev_best_v"] = state["best_v"].copy()
-        return diffv
-
-    movement_input_node = nengo.Node(
-        label       = "Movement",
-        output      = movement_input_func,
-        size_out    = 1,
-    )
-
-    # Adaptive threshold
-    def _gate(_x, k = 0.5):
-        _m_val                      = _x[0]
-        state["smoothed_improv"]    = ALPHA_IMPROV * state["smoothed_improv"] + (1 - ALPHA_IMPROV) * _m_val
-        _thresh                     = max(THRESHOLD_V, k * state["smoothed_improv"])
-        return np.array([np.clip(1.0 - _m_val / (_thresh + EPS), 0.0, 1.0)])
-
 
     # Features ensemble to extract features for utility computation
     neuromodulator_ens = nengo.Ensemble(
@@ -321,12 +296,6 @@ with model:
         n_neurons   = NEURONS_PER_ENS,
         dimensions  = NUM_FEATURES,
         radius      = 1.0,
-    )
-
-    stagnation_gate = nengo.Ensemble(
-        label       = "Stagnation Gate",
-        n_neurons   = NEURONS_PER_ENS,
-        dimensions  = 1,
     )
 
 
@@ -354,49 +323,32 @@ with model:
     nengo.Connection(centroid_node, error_centre, synapse=None, transform=np.eye(NUM_DIMS))
     nengo.Connection(motor_centre, error_centre, synapse=None, transform=-np.eye(NUM_DIMS))
 
-    # Gain modulation
-    nengo.Connection(error_centre, gain_product.A, synapse=TAU_1)
-    # nengo.Connection(neuromodulator_ens[0], gain_product.B, synapse=TAU_1, transform=GAIN_1 * np.ones((NUM_DIMS, 1)))
-    nengo.Connection(gain_bias, gain_product.B, synapse=None, transform=GAIN_2 * np.eye(NUM_DIMS))
-
     # Centre integrator and update
-    nengo.Connection(motor_centre, motor_centre, synapse=TAU_3, transform=np.eye(NUM_DIMS))
-    nengo.Connection(gain_product.output, motor_centre, synapse=TAU_3)
+    nengo.Connection(motor_centre, motor_centre, synapse=TAU_3, transform=0.9 * np.eye(NUM_DIMS))
+    nengo.Connection(error_centre, motor_centre, synapse=TAU_3, transform=GAIN_CENTRE * np.eye(NUM_DIMS))
 
     # SPREAD CONTROL LOOP
     # --------------------------------------------------------------
     # Leaky integrator
     nengo.Connection(motor_logsigma, motor_logsigma, synapse=TAU_3, transform=LEAK * np.eye(NUM_DIMS))
 
-    # Shrink (stagnation-driven)
-    # nengo.Connection(motor_logsigma, shrink_gate.A, synapse=TAU_1)
-    nengo.Connection(gain_bias, shrink_gate.A, synapse=None, transform=GAIN_2 * np.eye(NUM_DIMS))
-    nengo.Connection(neuromodulator_ens[1], shrink_gate.B, synapse=TAU_1, transform=ETA_S * np.ones((NUM_DIMS, 1)))
-    nengo.Connection(shrink_gate.output, motor_logsigma, synapse=TAU_3, transform=-np.eye(NUM_DIMS))
-
     # Grow (improvement-driven)
-    # nengo.Connection(motor_logsigma, grow_gate.A, synapse=TAU_1)
     nengo.Connection(gain_bias, grow_gate.A, synapse=None, transform=GAIN_2 * np.eye(NUM_DIMS))
     nengo.Connection(neuromodulator_ens[0], grow_gate.B, synapse=TAU_1, transform=ETA_G * np.ones((NUM_DIMS, 1)))
     nengo.Connection(grow_gate.output, motor_logsigma, synapse=TAU_3, transform=np.eye(NUM_DIMS))
 
-    # Inhibit grow when stagnating
-    # nengo.Connection(neuromodulator_ens[1], inhibit_grow, synapse=TAU_1)
-    # nengo.Connection(inhibit_grow, grow_gate.B, synapse=None)
-
-    # Inhibit shrink when improving
-    # nengo.Connection(neuromodulator_ens[0], inhibit_shrink, synapse=TAU_1)
-    # nengo.Connection(inhibit_shrink, shrink_gate.B, synapse=None)
-
-    # Clamp spread to valid range
-    nengo.Connection(motor_logsigma, clamp_spread, synapse=TAU_1)
+    # Shrink (stagnation-driven)
+    nengo.Connection(gain_bias, shrink_gate.A, synapse=None, transform=GAIN_2 * np.eye(NUM_DIMS))
+    nengo.Connection(neuromodulator_ens[1], shrink_gate.B, synapse=TAU_1, transform=ETA_S * np.ones((NUM_DIMS, 1)),
+                     function=lambda _x: 1.0 - np.clip(_x, 0.0, 1.0))
+    nengo.Connection(shrink_gate.output, motor_logsigma, synapse=TAU_3, transform=-np.eye(NUM_DIMS))
 
     # CANDIDATE GENERATION
     # --------------------------------------------------------------
     # Noise and scale
     nengo.Connection(noise_node, motor_noise, synapse=TAU_1)
-    # nengo.Connection(motor_logsigma, mult_spread_noise.A, synapse=TAU_2)
-    nengo.Connection(clamp_spread, mult_spread_noise.A, synapse=TAU_2)
+    nengo.Connection(motor_logsigma, mult_spread_noise.A, synapse=TAU_2,
+                     function=lambda _x: np.clip(np.exp(_x), SPREAD_MIN, SPREAD_MAX))
     nengo.Connection(motor_noise, mult_spread_noise.B, synapse=TAU_2)
 
     # Compose candidate
@@ -410,9 +362,7 @@ with model:
 
     # NEUROMODULATION (FEATURE INPUTS)
     # --------------------------------------------------------------
-    nengo.Connection(improv_input_node, neuromodulator_ens[0], synapse=TAU_2)
-    nengo.Connection(movement_input_node, stagnation_gate, synapse=TAU_2, function=_gate)
-    nengo.Connection(stagnation_gate, neuromodulator_ens[1], synapse=TAU_1)
+    nengo.Connection(features_input_node, neuromodulator_ens, synapse=TAU_2)
 
     # OUTPUTS
     # --------------------------------------------------------------
