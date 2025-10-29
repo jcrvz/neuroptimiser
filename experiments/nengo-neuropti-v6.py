@@ -1,6 +1,7 @@
 #%%
 import matplotlib.pyplot as plt
 import nengo
+from cocopp.comp2.ppscatter import markersize
 from sortedcontainers import SortedList
 import numpy as np
 from ioh import get_problem
@@ -18,7 +19,7 @@ NUM_DIMS        = 2  # Number of dimensions for the problem
 
 NEURONS_PER_DIM = 20 * NUM_DIMS
 NEURONS_PER_ENS = 100
-SIMULATION_TIME = 100.0  # seconds
+SIMULATION_TIME = 50.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMS)
 problem.reset()
@@ -42,7 +43,8 @@ X_UPPER_BOUND0  = X_UPPER_BOUND.copy()
 SEED_VALUE      = 69
 # SAMPLING_TIME   = 1.0
 NUM_FEATURES    = 2
-STAG_WAIT       = 3.0
+STAG_WAIT       = 1.00
+EXPL_WAIT       = 0.05
 ALPHA_IMPROV    = 0.20
 EPS             = 1e-12
 
@@ -61,8 +63,8 @@ _DENOM         = np.sqrt(max(3, NUM_DIMS))
 GAIN_1         = 5.0 / _DENOM
 GAIN_2         = 1.0 / (0.5 * GAIN_1)
 GAIN_CENTRE    = 5.0
-ETA_S          = 1.0
-ETA_G          = 1.0
+ETA_S          = 10.0
+ETA_G          = 10.0
 
 #%%
 
@@ -90,6 +92,9 @@ with model:
 
     # NOISE SOURCE: Generates perturbations
     def noise_func(t):
+        if t - state["t_last_improv"] < EXPL_WAIT:
+            return np.zeros(NUM_DIMS)
+
         _z  = np.random.normal(0.0, 1.0, NUM_DIMS)
         return np.clip(_z, -3.0, 3.0)
 
@@ -344,14 +349,15 @@ with model:
     # CANDIDATE GENERATION
     # --------------------------------------------------------------
     # Noise and scale
-    nengo.Connection(noise_node, motor_noise, synapse=TAU_1)
-    nengo.Connection(motor_logsigma, mult_spread_noise.A, synapse=TAU_2,
+    # nengo.Connection(noise_node, motor_noise, synapse=None)
+    nengo.Connection(motor_logsigma, mult_spread_noise.A, synapse=None,
                      function=lambda _x: np.clip(np.exp(_x), SPREAD_MIN, SPREAD_MAX))
-    nengo.Connection(motor_noise, mult_spread_noise.B, synapse=TAU_2)
+    # nengo.Connection(motor_noise, mult_spread_noise.B, synapse=None)
+    nengo.Connection(noise_node, mult_spread_noise.B, synapse=None)
 
     # Compose candidate
-    nengo.Connection(motor_centre, candidate_vector.input, synapse=TAU_2)
-    nengo.Connection(mult_spread_noise.output, candidate_vector.input, synapse=TAU_2)
+    nengo.Connection(motor_centre, candidate_vector.input, synapse=None)
+    nengo.Connection(mult_spread_noise.output, candidate_vector.input, synapse=None)
 
     # EVALUATION AND SELECTION
     # --------------------------------------------------------------
@@ -360,7 +366,7 @@ with model:
 
     # NEUROMODULATION (FEATURE INPUTS)
     # --------------------------------------------------------------
-    nengo.Connection(features_input_node, neuromodulator_ens, synapse=TAU_2)
+    nengo.Connection(features_input_node, neuromodulator_ens, synapse=0.5)
 
     # OUTPUTS
     # --------------------------------------------------------------
@@ -488,11 +494,11 @@ colors_1 = plt.cm.rainbow(np.linspace(0, 1, NUM_DIMS))
 num_samples = sim.data[centre_val].shape[0]
 every_n = max(1, num_samples // 50)
 for i in range(NUM_DIMS):
-    ax2.plot(sim.trange(), sim.data[centre_val][:, i], color=colors_1[i], linestyle="", marker=",", alpha=0.5,)
-    ax2.plot(sim.trange(), np.convolve(sim.data[centre_val][:,i], np.ones(100)/100, mode='same'), alpha=0.5,
+    ax2.plot(sim.trange(), sim.data[centre_val][:, i], color=colors_1[i], linestyle="", marker=".", markersize=1, alpha=0.2,)
+    ax2.plot(sim.trange(), np.convolve(sim.data[centre_val][:,i], np.ones(100)/100, mode='same'), alpha=1.0,
              color=colors_1[i], linestyle="dashed", marker="o", markevery=every_n, label=f"Centre dim {i+1}")
-    ax2.plot(sim.trange(), sim.data[spread_val][:, i], color=colors_1[i], linestyle="", marker=",", alpha=0.5, )
-    ax2.plot(sim.trange(), np.convolve(sim.data[spread_val][:,i], np.ones(100)/100, mode='same'), alpha=0.5,
+    ax2.plot(sim.trange(), sim.data[spread_val][:, i], color=colors_1[i], linestyle="", marker=".", markersize=1, alpha=0.2,)
+    ax2.plot(sim.trange(), np.convolve(sim.data[spread_val][:,i], np.ones(100)/100, mode='same'), alpha=1.0,
              color=colors_1[i], linestyle="dashed", marker="x", markevery=every_n, label=f"Spread dim {i + 1}")
 
 ax2.set_ylabel("Centre and Spread")
