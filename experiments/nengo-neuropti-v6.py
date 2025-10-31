@@ -110,7 +110,7 @@ with model:
         label           = "Motor Noise",
         n_neurons       = NEURONS_PER_ENS,
         dimensions      = NUM_DIMS,
-        radius          = 3.0,
+        radius          = 2.0,
     )
 
     # Initial conditions for motors
@@ -156,11 +156,17 @@ with model:
     # )
 
     # CENTRE Ensemble and control
-    motor_centre  = nengo.networks.EnsembleArray(
+    # motor_centre  = nengo.networks.EnsembleArray(
+    #     label           = "Motor Centre",
+    #     n_neurons       = NEURONS_PER_DIM * NUM_DIMS,
+    #     n_ensembles     = NUM_DIMS,
+    #     ens_dimensions  = 1,
+    #     radius          = 2.0,
+    # )
+    motor_centre = nengo.Ensemble(
         label           = "Motor Centre",
-        n_neurons       = NEURONS_PER_DIM * NUM_DIMS,
-        n_ensembles     = NUM_DIMS,
-        ens_dimensions  = 1,
+        n_neurons       = NEURONS_PER_ENS,
+        dimensions      = NUM_DIMS,
         radius          = 2.0,
     )
 
@@ -321,7 +327,7 @@ with model:
 
     # INITIALISATION CONNECTIONS
     # --------------------------------------------------------------
-    nengo.Connection(init_centre, motor_centre.input, synapse=TAU_0)
+    nengo.Connection(init_centre, motor_centre, synapse=TAU_0)
     nengo.Connection(init_spread, motor_logsigma, synapse=TAU_0)
 
     # CENTRE CONTROL LOOP
@@ -334,7 +340,7 @@ with model:
     # Centre integrator and update
     # nengo.Connection(motor_centre, motor_centre, synapse=TAU_1, transform=0.9 * np.eye(NUM_DIMS))
     # nengo.Connection(centre_control.output, motor_centre, synapse=TAU_1, transform=np.eye(NUM_DIMS))
-    nengo.Connection(centre_target_node, motor_centre.input, synapse=TAU_0, transform=np.eye(NUM_DIMS))
+    nengo.Connection(centre_target_node, motor_centre, synapse=TAU_0, transform=np.eye(NUM_DIMS))
     # nengo.Connection(selector_node[:NUM_DIMS], motor_centre, synapse=0.01, transform=GAIN_CENTRE * np.eye(NUM_DIMS))
 
     # SPREAD CONTROL LOOP
@@ -365,7 +371,7 @@ with model:
     nengo.Connection(noise_node, mult_spread_noise.B, synapse=None)
 
     # Compose candidate
-    nengo.Connection(motor_centre.output, candidate_vector.input, synapse=None)
+    nengo.Connection(motor_centre, candidate_vector.input, synapse=None)
     nengo.Connection(mult_spread_noise.output, candidate_vector.input, synapse=None)
 
     # EVALUATION AND SELECTION
@@ -385,15 +391,15 @@ with model:
     # PROBES
     # --------------------------------------------------------------
     # ens_lif_val     = nengo.Probe(motor.output, synapse=0.01)  # 10ms filter
-    obj_val         = nengo.Probe(obj_node[-1],         synapse=0.01)
-    fbest_val       = nengo.Probe(selector_node[-1],    synapse=0.01)
-    vbest_val       = nengo.Probe(selector_node[:NUM_DIMS], synapse=0.01)
+    obj_val         = nengo.Probe(obj_node[-1],         synapse=0.0)
+    fbest_val       = nengo.Probe(selector_node[-1],    synapse=0.0)
+    vbest_val       = nengo.Probe(selector_node[:NUM_DIMS], synapse=0.0)
     # ea_spk          = [nengo.Probe(ens.neurons, synapse=0.01) for ens in motor.ensembles]
 
-    # centre_val      = nengo.Probe(motor_centre,         synapse=0.01)
-    centre_val      = [nengo.Probe(motor_centre.ensembles[i], synapse=0.01) for i in range(NUM_DIMS)]
-    spread_val      = nengo.Probe(motor_logsigma,       synapse=0.01)
-    features_val    = nengo.Probe(neuromodulator_ens,   synapse=0.01)
+    centre_val      = nengo.Probe(motor_centre,         synapse=0.0)
+    # centre_val      = [nengo.Probe(motor_centre.ensembles[i], synapse=0.0) for i in range(NUM_DIMS)]
+    spread_val      = nengo.Probe(motor_logsigma,       synapse=0.0)
+    features_val    = nengo.Probe(neuromodulator_ens,   synapse=0.0)
 
     # utility_vals    = nengo.Probe(utility_ens, synapse=0.01)
 
@@ -412,7 +418,6 @@ print("-" * 55)
 vbest_values    = sim.data[vbest_val]
 
 xbest   = np.array([trs2o(vbest_values[i,:], X_LOWER_BOUND0, X_UPPER_BOUND0) for i in range(vbest_values.shape[0])])
-
 
 for i in range(NUM_DIMS):
     print(f" x{i+1:02d}: [{np.min(xbest[:,i]):.4f}, {np.max(xbest[:,i]):.4f}], ", end="")
@@ -446,14 +451,14 @@ plt.plot(sim.trange(), sim.data[fbest_val] - problem.optimum.y, label="Best-so-f
 # plt.plot(sim.trange(), sim.data[fbest_val] - problem.optimum.y, label="Best-so-far diff") #"Best-so-far value")
 
 # when an ensemble
-# centre_values   = sim.data[centre_val]
+centre_values   = sim.data[centre_val]
 # when a list of probes
-centre_values   = np.column_stack([sim.data[centre_val[i]] for i in range(NUM_DIMS)])
+# centre_values   = np.column_stack([sim.data[centre_val[i]] for i in range(NUM_DIMS)])
 
 centre_scaled = np.clip(centre_values, -1.0, 1.0)
 f_centre = np.array([eval_obj_func(centre_scaled[i,:]) for i in range(centre_scaled.shape[0])])
 
-plt.plot(sim.trange(), f_centre - problem.optimum.y, "g", marker=".", markersize=1, alpha=0.25)
+# plt.plot(sim.trange(), f_centre - problem.optimum.y, "g", marker=".", markersize=1, alpha=0.25)
 f_centre_smooth = np.convolve(f_centre, np.ones(100)/100, mode='same')
 plt.plot(sim.trange(), f_centre_smooth - problem.optimum.y, "g--", label="Centre error")
 
