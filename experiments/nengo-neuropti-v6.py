@@ -51,6 +51,13 @@ EPS             = 1e-12
 TAU_0           = 0.001
 TAU_1 = TAU_2 = 0.005
 TAU_3           = 0.01
+
+TAU_IMPROV_FAST = 0.02  # 20 ms
+TAU_IMPROV_SLOW = 0.12   # 120 ms
+K_IMPROV        = 1.0
+P_STAR          = 0.2   # target success rate (CSA-inspired, 1/5 rule)
+ETA_SIG         = 0.3 / np.sqrt(max(3, NUM_DIMS))
+
 LEAK            = 1.0
 
 LAMBDA          = 100
@@ -93,12 +100,7 @@ with model:
 
     # NOISE SOURCE: Generates perturbations
     def noise_func(t):
-        if t - state["t_last_improv"] <= EXPL_WAIT:
-            return np.zeros(NUM_DIMS)
-
         return np.random.normal(0.0, 1.0, NUM_DIMS)
-        # _z  = np.random.normal(0.0, 1.0, NUM_DIMS)
-        # return np.clip(_z, -3.0, 3.0)
 
     noise_node = nengo.Node(
         label       = "Noise Source",
@@ -106,11 +108,16 @@ with model:
         size_out    = NUM_DIMS,
     )
 
-    motor_noise     = nengo.Ensemble(
-        label           = "Motor Noise",
-        n_neurons       = NEURONS_PER_ENS,
-        dimensions      = NUM_DIMS,
-        radius          = 2.0,
+    # Gate noise by the improvement pulse: B_effective = (1 - gate) * noise
+    def _noise_gate_func(t, x):
+        gate_val = float(np.clip(x[0], 0.0, 1.0))
+        return (1.0 - gate_val) * x[1:]
+
+    noise_gate = nengo.Node(
+        label       = "Noise Gate",
+        output      = _noise_gate_func,
+        size_in     = 1 + NUM_DIMS,
+        size_out    = NUM_DIMS,
     )
 
     # Initial conditions for motors
@@ -127,11 +134,11 @@ with model:
 
     # Centre target node
     def centre_target_func(t, features):
-        if not state["archive"] or (t - state["t_last_improv"] <= EXPL_WAIT):
-            return state["best_v"]
-
         # Get the features
         improv_rate, stag_rate   = features
+
+        if not state["archive"] or improv_rate > 0.0:
+            return state["best_v"]
 
         # Compute the centroid of the top-mu solutions
         mu          = max(2, min(MU, len(state["archive"]) // 2))
@@ -149,20 +156,6 @@ with model:
     )
 
     # CENTRE CONTROL LOOP
-    # centre_control = nengo.networks.Product(
-    #     label       = "Centre Control",
-    #     n_neurons   = NEURONS_PER_ENS,
-    #     dimensions  = NUM_DIMS,
-    # )
-
-    # CENTRE Ensemble and control
-    # motor_centre  = nengo.networks.EnsembleArray(
-    #     label           = "Motor Centre",
-    #     n_neurons       = NEURONS_PER_DIM * NUM_DIMS,
-    #     n_ensembles     = NUM_DIMS,
-    #     ens_dimensions  = 1,
-    #     radius          = 2.0,
-    # )
     motor_centre = nengo.Ensemble(
         label           = "Motor Centre",
         n_neurons       = NEURONS_PER_ENS,
@@ -171,7 +164,6 @@ with model:
     )
 
     # Scalar gain
-
     gain_bias = nengo.Node(
         label       = "Gain Bias",
         output      = 1.0 * GAIN_1 * np.ones(NUM_DIMS),
@@ -183,20 +175,6 @@ with model:
         n_neurons       = NEURONS_PER_DIM,
         dimensions      = NUM_DIMS,
         radius          = 1.5,
-    )
-
-    # Shrink when stagnation is detected
-    shrink_gate = nengo.networks.Product(
-        label       = "Shrink Gate",
-        n_neurons   = NEURONS_PER_ENS,
-        dimensions  = NUM_DIMS,
-    )
-
-    # Grow when significant improvement is detected
-    grow_gate = nengo.networks.Product(
-        label       = "Grow Gate",
-        n_neurons   = NEURONS_PER_ENS,
-        dimensions  = NUM_DIMS,
     )
 
     # COMPOSE NODE: Combine centre and spread into state vector
@@ -334,13 +312,14 @@ with model:
     # --------------------------------------------------------------
     # Compute error between target and current centre
     nengo.Connection(neuromodulator_ens, centre_target_node, synapse=TAU_0)
+    nengo.Connection(selector_node[-1], centre_target_node[0], synapse=0.0, transform=-1.0)
     # nengo.Connection(centre_target_node, centre_control.A, synapse=TAU_1, transform=GAIN_CENTRE * np.eye(NUM_DIMS))
     # nengo.Connection(neuromodulator_ens[0], centre_control.B, synapse=None, transform=np.ones((NUM_DIMS, 1)))
 
     # Centre integrator and update
     # nengo.Connection(motor_centre, motor_centre, synapse=TAU_1, transform=0.9 * np.eye(NUM_DIMS))
     # nengo.Connection(centre_control.output, motor_centre, synapse=TAU_1, transform=np.eye(NUM_DIMS))
-    nengo.Connection(centre_target_node, motor_centre, synapse=TAU_0, transform=np.eye(NUM_DIMS))
+    nengo.Connection(centre_target_node, motor_centre, synapse=None)
     # nengo.Connection(selector_node[:NUM_DIMS], motor_centre, synapse=0.01, transform=GAIN_CENTRE * np.eye(NUM_DIMS))
 
     # SPREAD CONTROL LOOP
@@ -348,27 +327,23 @@ with model:
     # Leaky integrator
     nengo.Connection(motor_logsigma, motor_logsigma, synapse=TAU_3, transform=LEAK * np.eye(NUM_DIMS))
 
-    # Grow (improvement-driven)
-    nengo.Connection(gain_bias, grow_gate.A, synapse=None, transform=GAIN_2 * np.eye(NUM_DIMS))
-    nengo.Connection(neuromodulator_ens[0], grow_gate.B, synapse=None, transform=ETA_G * np.ones((NUM_DIMS, 1)),
-                     function=lambda _x: np.clip(_x, 0.0, 1.0))
-    nengo.Connection(grow_gate.output, motor_logsigma, synapse=TAU_3, transform=np.eye(NUM_DIMS))
-
-    # Shrink (stagnation-driven)
-    nengo.Connection(gain_bias, shrink_gate.A, synapse=None, transform=GAIN_2 * np.eye(NUM_DIMS))
-    nengo.Connection(neuromodulator_ens[1], shrink_gate.B, synapse=None, transform=ETA_S * np.ones((NUM_DIMS, 1)),
-                     # function=lambda _x: 1.0 - _x)
-                     function=lambda _x: np.clip(_x, 0.0, 1.0))
-    nengo.Connection(shrink_gate.output, motor_logsigma, synapse=TAU_3, transform=-np.eye(NUM_DIMS))
+    # CSA-style step-size update: d(logσ)/dt ∝ (pulse - p*)
+    nengo.Connection(neuromodulator_ens[0], motor_logsigma, synapse=TAU_3,
+                     transform=ETA_SIG * np.ones((NUM_DIMS, 1)))
+    nengo.Connection(gain_bias, motor_logsigma, synapse=None,
+                     transform=-(ETA_SIG * P_STAR) * np.eye(NUM_DIMS))
 
     # CANDIDATE GENERATION
     # --------------------------------------------------------------
     # Noise and scale
-    nengo.Connection(noise_node, motor_noise, synapse=None)
     nengo.Connection(motor_logsigma, mult_spread_noise.A, synapse=None,
                      function=lambda _x: np.clip(np.exp(_x), SPREAD_MIN, SPREAD_MAX))
-    nengo.Connection(motor_noise, mult_spread_noise.B, synapse=None)
-    nengo.Connection(noise_node, mult_spread_noise.B, synapse=None)
+
+    # Route pulse and raw noise into the gate, then into Product.B
+    nengo.Connection(neuromodulator_ens[0], noise_gate[0], synapse=TAU_0)
+    nengo.Connection(noise_node,              noise_gate[1:], synapse=None)
+    nengo.Connection(noise_gate,              mult_spread_noise.B, synapse=None)
+
 
     # Compose candidate
     nengo.Connection(motor_centre, candidate_vector.input, synapse=None)
@@ -381,7 +356,12 @@ with model:
 
     # NEUROMODULATION (FEATURE INPUTS)
     # --------------------------------------------------------------
-    nengo.Connection(features_input_node, neuromodulator_ens, synapse=0.5)
+    # Improvement pulse on neuromodulator[0] = LPF_slow(best_f) - LPF_fast(best_f)
+    nengo.Connection(selector_node[-1], neuromodulator_ens[0], synapse=TAU_IMPROV_SLOW, transform=+K_IMPROV)
+    nengo.Connection(selector_node[-1], neuromodulator_ens[0], synapse=TAU_IMPROV_FAST, transform=-K_IMPROV)
+
+    # Keep stagnation/other feature on channel 1
+    nengo.Connection(features_input_node[1], neuromodulator_ens[1], synapse=0.5)
 
     # OUTPUTS
     # --------------------------------------------------------------
@@ -476,10 +456,10 @@ ax2 = ax1.twinx()
 
 improv_rate = sim.data[features_val][:,0]
 succes_rate = sim.data[features_val][:,1]
-ax2.plot(sim.trange(), improv_rate, "c", marker=".", markersize=1, alpha=0.2)
-ax2.plot(sim.trange(), np.convolve(improv_rate, np.ones(100)/100, mode='same'), "c--", label="Impr. Rate")
-ax2.plot(sim.trange(), succes_rate, "y", marker=".", markersize=1, alpha=0.2)
-ax2.plot(sim.trange(), np.convolve(succes_rate, np.ones(100)/100, mode='same'), "y--", label="Stag. Rate")
+ax2.plot(sim.trange(), improv_rate, "b", marker=".", markersize=1, linestyle="", alpha=0.2)
+ax2.plot(sim.trange(), np.convolve(improv_rate, np.ones(100)/100, mode='same'), "b--", label="Impr. Rate")
+ax2.plot(sim.trange(), succes_rate, "r", marker=".", markersize=1, linestyle="", alpha=0.2)
+ax2.plot(sim.trange(), np.convolve(succes_rate, np.ones(100)/100, mode='same'), "r--", label="Stag. Rate")
 
 
 ax2.set_ylabel("Feature value")
