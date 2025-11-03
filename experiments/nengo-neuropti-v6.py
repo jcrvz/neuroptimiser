@@ -1,25 +1,23 @@
 #%%
 import matplotlib.pyplot as plt
 import nengo
-from cocopp.comp2.ppscatter import markersize
 from sortedcontainers import SortedList
 import numpy as np
 from ioh import get_problem
-from nengo.utils.matplotlib import rasterplot, implot
 
 # Transformations
 from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 10  # Problem ID from the IOH framework
+PROBLEM_ID      = 1  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_OBJS        = 1   # Number of objectives (only single-objective supported here)
 NUM_DIMS        = 2  # Number of dimensions for the problem
 
 NEURONS_PER_DIM = 20 * NUM_DIMS
 NEURONS_PER_ENS = 100
-SIMULATION_TIME = 50.0  # seconds
+SIMULATION_TIME = 1.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMS)
 problem.reset()
@@ -28,6 +26,8 @@ print(problem)
 X_LOWER_BOUND   = problem.bounds.lb
 X_UPPER_BOUND   = problem.bounds.ub
 X_INITIAL_GUESS = np.random.uniform(X_LOWER_BOUND, X_UPPER_BOUND, NUM_DIMS)
+V_INITIAL_GUESS = tro2s(X_INITIAL_GUESS, X_LOWER_BOUND, X_UPPER_BOUND)
+F_INITIAL_GUESS = problem(X_INITIAL_GUESS)
 
 def eval_obj_func(v_scaled):
     # Transform from scaled to original
@@ -35,44 +35,35 @@ def eval_obj_func(v_scaled):
     f_val   = problem(x_orig)
     return f_val
 
-# Keep copies of the original global bounds
-X_LOWER_BOUND0  = X_LOWER_BOUND.copy()
-X_UPPER_BOUND0  = X_UPPER_BOUND.copy()
-
 # Exploitation (search-space shrinking) schedule
-SEED_VALUE      = 69
-# SAMPLING_TIME   = 1.0
-NUM_FEATURES    = 2
-STAG_WAIT       = 1.00
-EXPL_WAIT       = 0.05
-ALPHA_IMPROV    = 0.20
 EPS             = 1e-12
 
 TAU_0           = 0.001
-TAU_1 = TAU_2 = 0.005
-TAU_3           = 0.01
+TAU_3           = 0.005
 
-TAU_IMPROV_FAST = 0.02  # 20 ms
-TAU_IMPROV_SLOW = 0.05   # 120 ms
-K_IMPROV        = 1.0
-P_STAR          = 0.2   # target success rate (CSA-inspired, 1/5 rule)
-ETA_SIG         = 0.3 / np.sqrt(max(3, NUM_DIMS))
+TAU_IMPROV_FAST = 0.001  # 5 ms
+TAU_IMPROV_SLOW = 0.002  # 50 ms
+INIT_TIME       = 0.001   # time to initialise the optimiser
+K_IMPROV        = 10.0
+P_STAR          = 0.5   # target success rate (CSA-inspired, 1/5 rule)
+ETA_SIG         = 1.0 #0.3 / np.sqrt(max(3, NUM_DIMS))
 
 LEAK            = 1.0
 
-LAMBDA          = 100
+LAMBDA          = 50
 MU              = max(4, LAMBDA // 2)
-SPREAD_MIN      = 1e-6
-SPREAD_MAX      = 0.25
+SIG_MAX         = 0.5
+SIG_MIN         = 1e-12
+LOGSIG_MAX      = np.log(SIG_MAX)
+LOGSIG_MIN      = np.log(SIG_MIN)
+SUMLOGSIG       = LOGSIG_MAX + LOGSIG_MIN
+DIFLOGSIG       = LOGSIG_MAX - LOGSIG_MIN
+
+EXPLOIT_WIN     = 0.01  # s
 
 THRESHOLD_V    = 1e-3
 
-_DENOM         = np.sqrt(max(3, NUM_DIMS))
-GAIN_1         = 1.0 #/ _DENOM
-GAIN_2         = 1.0 # / (0.5 * GAIN_1)
-GAIN_CENTRE    = 1.0
-ETA_S          = 1.0
-ETA_G          = 1.0
+GAIN_1         = 1.0
 
 #%%
 
@@ -85,59 +76,84 @@ with model:
     state = {
         "lb":               X_LOWER_BOUND.copy(),   # dynamic local bounds
         "ub":               X_UPPER_BOUND.copy(),
-        "best_v":           X_INITIAL_GUESS.copy(),
-        "prev_best_v":      X_INITIAL_GUESS.copy(),
-        "best_f":           None,                   # best objective value
-        "prev_best_f":      None,                   # previous best objective value
+        "best_v":           V_INITIAL_GUESS.copy(),
+        "prev_best_v":      V_INITIAL_GUESS.copy(),
+        "best_f":           F_INITIAL_GUESS,                   # best objective value
+        "prev_best_f":      F_INITIAL_GUESS,                   # previous best objective value
         "smoothed_improv":  1.0,                    # smoothed improvement metric
-        "t_last_improv":    0.0,                    # time when stagnation started
         "archive":          SortedList(key=lambda _x: _x[1]),       # small archive to represent the sampling phase
+        "t_last_improv":   0.0,                    # time of last improvement
         "sigma":            0.25,                    # current spread value
     }
 
     # DEFINE THE MAIN COMPONENTS
     # --------------------------------------------------------------
-
-    # NOISE SOURCE: Generates perturbations
-    def noise_func(t):
-        return np.random.normal(0.0, 1.0, NUM_DIMS)
-
-    noise_node = nengo.Node(
-        label       = "Noise Source",
-        output      = noise_func,
-        size_out    = NUM_DIMS,
-    )
+    # def improve_gate_func(t, fvals):
+    #     # Extract best and previous best objective values
+    #     curr_f      = fvals[0]
+    #     best_f      = fvals[1]
+    #
+    #     if best_f - curr_f > EPS:
+    #         return 1.0
+    #
+    #     return 0.0
+    #
+    # improve_gate_node = nengo.Node(
+    #     label       = "Improve Gate",
+    #     output      = improve_gate_func,
+    #     size_in     = 2 * NUM_OBJS,
+    #     size_out    = 1,
+    # )
 
     # Gate noise by the improvement pulse: B_effective = (1 - gate) * noise
-    def _noise_gate_func(t, x):
-        gate_val = float(np.clip(x[0], 0.0, 1.0))
-        return (1.0 - gate_val) * x[1:]
+    def _noise_gate_func(t, feature):
+        if (t - state["t_last_improv"]) < EXPLOIT_WIN or t < INIT_TIME:
+            return np.zeros(NUM_DIMS)
+
+        return np.random.normal(0.0, 1.0, NUM_DIMS)
 
     noise_gate = nengo.Node(
         label       = "Noise Gate",
         output      = _noise_gate_func,
-        size_in     = 1 + NUM_DIMS,
+        size_in     = 1,
         size_out    = NUM_DIMS,
     )
 
-    # Initial conditions for motors
-    init_centre     = nengo.Node(
-        label       = "Init Centre",
-        output      = lambda t: X_INITIAL_GUESS.copy() if t < 0.001 else np.zeros(NUM_DIMS),
+    # Spread target node
+    def spread_target_func(t, _improv_rates):
+        if t < INIT_TIME:
+            return np.ones(NUM_DIMS)
+
+        if (t - state["t_last_improv"]) < EXPLOIT_WIN:
+            return -1.0 * np.ones(NUM_DIMS)
+        spreads = np.clip(_improv_rates, 0.0, 1.0)
+
+        # Adapt spread based on improvement rate
+        amgis = 1.0 - 2.0 * spreads
+
+        return amgis * np.ones(NUM_DIMS)
+
+
+    spread_target_node = nengo.Node(
+        label       = "Spread Target",
+        output      = spread_target_func,
+        size_in     = NUM_DIMS,
         size_out    = NUM_DIMS,
     )
-    init_spread = nengo.Node(
-        label       = "Init Spread",
-        output      = lambda t: np.log(0.25) * np.ones(NUM_DIMS) if t < 0.001 else np.zeros(NUM_DIMS),
-        size_out    = NUM_DIMS,
-    )
+
+    def _sigmoid_normalise(x):
+        x = np.clip(x, 0.0, 1.0)
+
+        # x = 1.0 if x >= 1e-3 else x
+
+        return 1.0 / (1.0 + np.exp(-6.0 * (x - 0.5)))
 
     # Centre target node
-    def centre_target_func(t, features):
-        # Get the features
-        improv_rate, stag_rate   = features
+    def centre_target_func(t, improv_rates):
+        if t < INIT_TIME:
+            return V_INITIAL_GUESS.copy()
 
-        if not state["archive"] or improv_rate > 0.0:
+        if not state["archive"] or (t - state["t_last_improv"]) < EXPLOIT_WIN:
             return state["best_v"]
 
         # Compute the centroid of the top-mu solutions
@@ -146,12 +162,13 @@ with model:
         centroid   = np.mean(elite, axis=0)
 
         # Blend between best-so-far and centroid based on success rate
-        return improv_rate * state["best_v"] + (1.0 - improv_rate) * centroid
+        # return improv_rate * state["best_v"] + (1.0 - improv_rate) * centroid
+        return centroid
 
     centre_target_node = nengo.Node(
         label       = "Centre Target",
         output      = centre_target_func,
-        size_in     = NUM_FEATURES,
+        size_in     = NUM_DIMS,
         size_out    = NUM_DIMS,
     )
 
@@ -163,18 +180,12 @@ with model:
         radius          = 2.0,
     )
 
-    # Scalar gain
-    gain_bias = nengo.Node(
-        label       = "Gain Bias",
-        output      = 1.0 * GAIN_1 * np.ones(NUM_DIMS),
-    )
-
-    # SPREAD (log) Ensemble and control
-    motor_logsigma = nengo.Ensemble(
+    # Amgis Ensemble and control: amgis in [-1, 1] -> |ln(sigma)| in [0.0, 12.0] -> ln(sigma) in [-12.0, 0.0] | sigma in [1e-12, 1.0]
+    motor_amgis = nengo.Ensemble(
         label           = "Motor Spread",
         n_neurons       = NEURONS_PER_DIM,
         dimensions      = NUM_DIMS,
-        radius          = 1.5,
+        radius          = 2.0,
     )
 
     # COMPOSE NODE: Combine centre and spread into state vector
@@ -196,11 +207,14 @@ with model:
 
     # OBJECTIVE FUNCTION NODE: Evaluate the objective function
     def objective_func(t, variables):
+        if t < INIT_TIME:
+            v   = V_INITIAL_GUESS.copy()
+            fv  = eval_obj_func(v)
+            return  np.concatenate((v, [fv]))
+
         v   = np.clip(variables, -1.0, 1.0)
         fv  = eval_obj_func(v)
         return np.concatenate((v, [fv]))
-
-    state["best_f"] = objective_func(0.0, tro2s(X_INITIAL_GUESS, state["lb"], state["ub"]))[-1]
 
     obj_node = nengo.Node(
         label       = "Problem",
@@ -211,6 +225,9 @@ with model:
 
     # SELECTOR NODE: Keep track of best-so-far solution
     def selector_func(t, vf):
+        if t < INIT_TIME:
+            return np.concatenate((state["best_v"], [state["best_f"]]))
+
         # Extract candidate solution and its objective value
         v       = vf[:NUM_DIMS]
         fv      = float(vf[NUM_DIMS])
@@ -223,13 +240,11 @@ with model:
             state["archive"].pop()
 
         # Update improvement metrics
-        if state["best_f"] is None or (fv < state["best_f"]):
+        if fv < state["best_f"]:
             state["prev_best_f"]    = state["best_f"] if state["best_f"] is not None else fv
+            state["best_v"]         = v.copy()
             state["best_f"]         = fv
 
-            state["best_v"]         = v.copy()
-
-            state["t_last_improv"]   = t
 
         return np.concatenate((state["best_v"], [state["best_f"]]))
 
@@ -242,106 +257,109 @@ with model:
 
     # FEATURES ENSEMBLE: Extract features from the current evaluation
 
-    def _feat_stagnation_rate(t):
-        if state["prev_best_f"] is None:
-            return 0.0
-        time_since  = max(EPS, t - state["t_last_improv"])
-        stag_rate   = (time_since / STAG_WAIT) ** 3
-        return stag_rate
+    # def _feat_stagnation_rate(t):
+    #     if state["prev_best_f"] is None:
+    #         return 0.0
+    #     time_since  = max(EPS, t - state["t_last_improv"])
+    #     stag_rate   = (time_since / STAG_WAIT) ** 3
+    #     return stag_rate
 
-    def _feat_success_rate(t):
-        if len(state["archive"]) < 2:
-            return 0.5
+    # def _feat_success_rate(t):
+    #     if len(state["archive"]) < 2:
+    #         return 0.5
+    #
+    #     f_values = [fv for _, fv in state["archive"]]
+    #     median_f = np.median(f_values)
+    #     num_success = np.sum(f_values < median_f)
+    #     return num_success / len(f_values)
 
-        f_values = [fv for _, fv in state["archive"]]
-        median_f = np.median(f_values)
-        num_success = np.sum(f_values < median_f)
-        return num_success / len(f_values)
+    # def _feat_fitness_diversity(t):
+    #     if len(state["archive"]) < 2:
+    #         return 0.0
+    #
+    #     mu      = max(2, min(MU, len(state["archive"]) // 2))
+    #     elite_f = [fv for _, fv in state["archive"][:mu]]
+    #
+    #     std_eli = np.std(elite_f)
+    #     mean_eli= np.mean(elite_f) + EPS
+    #
+    #     return std_eli / mean_eli
 
-    def _feat_fitness_diversity(t):
-        if len(state["archive"]) < 2:
-            return 0.0
+    # Features node
+    def features_func(t, _diff_vf):
+        if t < INIT_TIME:
+            return np.ones(NUM_DIMS)
 
-        mu      = max(2, min(MU, len(state["archive"]) // 2))
-        elite_f = [fv for _, fv in state["archive"][:mu]]
+        # _curr_prev_vf = [curr_v, curr_f, prev_v, prev_f]
+        _diffv  = _diff_vf[:NUM_DIMS]
+        _difff  = _diff_vf[NUM_DIMS: NUM_DIMS + NUM_OBJS]
 
-        std_eli = np.std(elite_f)
-        mean_eli= np.mean(elite_f) + EPS
+        # If improvement occurred, update state
+        if _difff > 0.0:
+            state["t_last_improv"] = t
+            # fast growth towards 1.0 when improvement occurs
+            val_f   = 1.0 #0.1 + 0.9 * (1.0 - np.exp(-50.0 * _rel_improf))
+        else:
+            val_f   = 0.0
 
-        return std_eli / mean_eli
+        # Compute difference in solution vectors
+        vals_v       = val_f * _diffv
 
-    def _improvement_rate(t):
-        if state["prev_best_f"] is None:
-            return 0.0
-
-        delta_f     = max(0.0, state["prev_best_f"] - state["best_f"])
-        rel_improv  = delta_f / (abs(state["prev_best_f"]) + EPS)
-
-        return rel_improv
-
-    # Features input node
-    def features_input_func(t):
-        features = []
-        for _feat in [_improvement_rate, _feat_stagnation_rate]:
-            feat_val = _feat(t)
-            features.append(feat_val)
+        # Assemble features
+        # vals        = np.concatenate((val_v, [val_f]))
 
         # return features
-        return np.clip(features, 0.0, 1.0)
+        return np.clip(vals_v, -1.0, 1.0)
 
     features_input_node = nengo.Node(
-        label       = "Features Input",
-        output      = features_input_func,
-        size_out    = NUM_FEATURES,
+        label       = "Features Gate",
+        output      = features_func,
+        size_in     = NUM_DIMS + NUM_OBJS,
+        size_out    = NUM_DIMS,
+    )
+
+    init_node = nengo.Node(
+        label       = "Initialiser",
+        output      = lambda t: np.ones(NUM_DIMS) if t < INIT_TIME else np.zeros(NUM_DIMS),
     )
 
     # Features ensemble to extract features for utility computation
-    neuromodulator_ens = nengo.Ensemble(
+    neuromodulator_ens = nengo.networks.EnsembleArray(
         label       = "Neuromodulator",
         n_neurons   = NEURONS_PER_ENS,
-        dimensions  = NUM_FEATURES,
-        radius      = 1.0,
+        n_ensembles = NUM_DIMS,
+        ens_dimensions = 1,
+        radius      = 1.1,
     )
 
     # INITIALISATION CONNECTIONS
     # --------------------------------------------------------------
-    nengo.Connection(init_centre, motor_centre, synapse=TAU_0)
-    nengo.Connection(init_spread, motor_logsigma, synapse=TAU_0)
+    nengo.Connection(init_node, centre_target_node[:NUM_DIMS], synapse=None)
+    nengo.Connection(init_node, spread_target_node[:NUM_DIMS], synapse=None)
+    nengo.Connection(init_node, neuromodulator_ens.input, synapse=None)
 
     # CENTRE CONTROL LOOP
     # --------------------------------------------------------------
     # Compute error between target and current centre
-    nengo.Connection(neuromodulator_ens, centre_target_node, synapse=TAU_0)
-    nengo.Connection(selector_node[-1], centre_target_node[0], synapse=0.0, transform=-1.0)
-    # nengo.Connection(centre_target_node, centre_control.A, synapse=TAU_1, transform=GAIN_CENTRE * np.eye(NUM_DIMS))
-    # nengo.Connection(neuromodulator_ens[0], centre_control.B, synapse=None, transform=np.ones((NUM_DIMS, 1)))
+    nengo.Connection(neuromodulator_ens.output, centre_target_node[:NUM_DIMS], synapse=0.0)
+    nengo.Connection(neuromodulator_ens.output, spread_target_node[:NUM_DIMS], synapse=0.0)
 
-    # Centre integrator and update
-    # nengo.Connection(motor_centre, motor_centre, synapse=TAU_1, transform=0.9 * np.eye(NUM_DIMS))
-    # nengo.Connection(centre_control.output, motor_centre, synapse=TAU_1, transform=np.eye(NUM_DIMS))
     nengo.Connection(centre_target_node, motor_centre, synapse=None)
-    # nengo.Connection(selector_node[:NUM_DIMS], motor_centre, synapse=0.01, transform=GAIN_CENTRE * np.eye(NUM_DIMS))
-
-    # SPREAD CONTROL LOOP
-    # --------------------------------------------------------------
-    # Leaky integrator
-    nengo.Connection(motor_logsigma, motor_logsigma, synapse=TAU_3, transform=LEAK * np.eye(NUM_DIMS))
-
-    # CSA-style step-size update: d(logσ)/dt ∝ (pulse - p*)
-    nengo.Connection(neuromodulator_ens[0], motor_logsigma, synapse=TAU_3,
-                     transform=ETA_SIG * np.ones((NUM_DIMS, 1)))
-    nengo.Connection(gain_bias, motor_logsigma, synapse=None,
-                     transform=-(ETA_SIG * P_STAR) * np.eye(NUM_DIMS))
+    nengo.Connection(spread_target_node, motor_amgis, synapse=None,
+                     transform=np.eye(NUM_DIMS))
 
     # CANDIDATE GENERATION
     # --------------------------------------------------------------
     # Noise and scale
-    nengo.Connection(motor_logsigma, mult_spread_noise.A, synapse=None,
-                     function=lambda _x: np.clip(np.exp(_x), SPREAD_MIN, SPREAD_MAX))
 
-    # Route pulse and raw noise into the gate, then into Product.B
-    nengo.Connection(neuromodulator_ens[0], noise_gate[0], synapse=TAU_0)
-    nengo.Connection(noise_node,              noise_gate[1:], synapse=None)
+    def amgisIIsigma(_amgis):
+        _amgis          = np.clip(_amgis, -1.0, 1.0)
+        _log_sigma  = 0.5 * (DIFLOGSIG * _amgis + SUMLOGSIG)
+        return np.clip(np.exp(_log_sigma), SIG_MIN, SIG_MAX)
+
+    nengo.Connection(motor_amgis, mult_spread_noise.A, synapse=None,
+                     function=amgisIIsigma)
+    nengo.Connection(neuromodulator_ens.output[-1], noise_gate, synapse=None)
     nengo.Connection(noise_gate,              mult_spread_noise.B, synapse=None)
 
 
@@ -354,19 +372,18 @@ with model:
     nengo.Connection(candidate_vector.output, obj_node, synapse=None)
     nengo.Connection(obj_node, selector_node, synapse=None)
 
+    # nengo.Connection(obj_node[-1], improve_gate_node[0], synapse=0.0)
+    # nengo.Connection(selector_node[-1], improve_gate_node[1], synapse=0.0)
+
     # NEUROMODULATION (FEATURE INPUTS)
     # --------------------------------------------------------------
-    # Improvement pulse on neuromodulator[0] = LPF_slow(best_f) - LPF_fast(best_f)
-    nengo.Connection(selector_node[-1], neuromodulator_ens[0], synapse=TAU_IMPROV_SLOW, transform=+K_IMPROV)
-    nengo.Connection(selector_node[-1], neuromodulator_ens[0], synapse=TAU_IMPROV_FAST, transform=-K_IMPROV)
+    nengo.Connection(selector_node, features_input_node,
+                     synapse=TAU_IMPROV_SLOW, transform=+K_IMPROV)
+    nengo.Connection(selector_node, features_input_node,
+                     synapse=TAU_IMPROV_FAST, transform=-K_IMPROV)
 
     # Keep stagnation/other feature on channel 1
-    nengo.Connection(features_input_node[1], neuromodulator_ens[1], synapse=0.5)
-
-    # OUTPUTS
-    # --------------------------------------------------------------
-    # nengo.Connection(selector_node, fbest_only, synapse=None)
-    # nengo.Connection(selector_node, xbest_only, synapse=None)
+    nengo.Connection(features_input_node, neuromodulator_ens.input, synapse=None)
 
     # PROBES
     # --------------------------------------------------------------
@@ -374,14 +391,11 @@ with model:
     obj_val         = nengo.Probe(obj_node[-1],         synapse=0.0)
     fbest_val       = nengo.Probe(selector_node[-1],    synapse=0.0)
     vbest_val       = nengo.Probe(selector_node[:NUM_DIMS], synapse=0.0)
-    # ea_spk          = [nengo.Probe(ens.neurons, synapse=0.01) for ens in motor.ensembles]
 
     centre_val      = nengo.Probe(motor_centre,         synapse=0.0)
-    # centre_val      = [nengo.Probe(motor_centre.ensembles[i], synapse=0.0) for i in range(NUM_DIMS)]
-    spread_val      = nengo.Probe(motor_logsigma,       synapse=0.0)
-    features_val    = nengo.Probe(neuromodulator_ens,   synapse=0.0)
-
-    # utility_vals    = nengo.Probe(utility_ens, synapse=0.01)
+    spread_val      = nengo.Probe(mult_spread_noise.A,       synapse=0.0)
+    # features_val    = nengo.Probe(neuromodulator_ens,   synapse=0.0)
+    features_val    = nengo.Probe(features_input_node,   synapse=0.0)
 
 #%%
 # Create our simulator
@@ -397,7 +411,7 @@ print("-" * 55)
 
 vbest_values    = sim.data[vbest_val]
 
-xbest   = np.array([trs2o(vbest_values[i,:], X_LOWER_BOUND0, X_UPPER_BOUND0) for i in range(vbest_values.shape[0])])
+xbest   = np.array([trs2o(vbest_values[i,:], X_LOWER_BOUND, X_UPPER_BOUND) for i in range(vbest_values.shape[0])])
 
 for i in range(NUM_DIMS):
     print(f" x{i+1:02d}: [{np.min(xbest[:,i]):.4f}, {np.max(xbest[:,i]):.4f}], ", end="")
@@ -444,7 +458,7 @@ plt.plot(sim.trange(), f_centre_smooth - problem.optimum.y, "g--", label="Centre
 
 # add second axis for centre and spread
 ax1 = plt.gca()
-plt.xlim(0, SIMULATION_TIME)
+plt.xlim(0 - INIT_TIME, SIMULATION_TIME)
 plt.xlabel("Time, s")
 plt.ylabel("Objective value error")
 plt.yscale("log")
@@ -454,15 +468,17 @@ ax2 = ax1.twinx()
 # ax2.plot(sim.trange(), np.average(sim.data[centre_val], axis=1), "g--", label="Centre")
 # ax2.plot(sim.trange(), np.exp(np.average(sim.data[spread_val], axis=1)), "m--", label="Spread")
 
-improv_rate = sim.data[features_val][:,0]
-succes_rate = sim.data[features_val][:,1]
-ax2.plot(sim.trange(), improv_rate, "b", marker=".", markersize=1, linestyle="", alpha=0.2)
-ax2.plot(sim.trange(), np.convolve(improv_rate, np.ones(100)/100, mode='same'), "b--", label="Impr. Rate")
-ax2.plot(sim.trange(), succes_rate, "r", marker=".", markersize=1, linestyle="", alpha=0.2)
-ax2.plot(sim.trange(), np.convolve(succes_rate, np.ones(100)/100, mode='same'), "r--", label="Stag. Rate")
+colors_1 = plt.cm.rainbow(np.linspace(0, 1, NUM_DIMS))
+for i in range(NUM_DIMS):
+    improv_rate = sim.data[features_val][:,i]
+    # succes_rate = sim.data[features_val][:,1]
+    ax2.plot(sim.trange(), improv_rate, color=colors_1[i], marker=".", markersize=1, linestyle="", alpha=0.2)
+    ax2.plot(sim.trange(), np.convolve(improv_rate, np.ones(100)/100, mode='same'), linestyle="dashed", color=colors_1[i], label=f"Dim {i+1}")
+    # ax2.plot(sim.trange(), succes_rate, "r", marker=".", markersize=1, linestyle="", alpha=0.2)
+    # ax2.plot(sim.trange(), np.convolve(succes_rate, np.ones(100)/100, mode='same'), "r--", label="Stag. Rate")
 
 
-ax2.set_ylabel("Feature value")
+ax2.set_ylabel("Improvement rate")
 ax2.set_yscale("linear")
 ax2.legend(loc="upper right")
 
@@ -472,24 +488,23 @@ plt.show()
 
 #%%
 # Plot the decoded output of the ensemble
-plt.figure(figsize=(12, 8), dpi=150)
-ax1 = plt.gca()
+fig, axs = plt.subplots(3, 1, figsize=(12, 8), dpi=150, sharex=True)
+
+ax1 = axs[0]
 # plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
 # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -5, 5, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
-plt.plot(sim.trange(), xbest, label=[f"x{i + 1}" for i in range(NUM_DIMS)])
+ax1.plot(sim.trange(), xbest, label=[f"x{i + 1}" for i in range(NUM_DIMS)])
 
 for i in range(NUM_DIMS):
-    plt.hlines(problem.optimum.x[i], 0, SIMULATION_TIME, colors="k", linestyles="dashed", label=f"xopt" if i==0 else None)
+    ax1.hlines(problem.optimum.x[i], 0, SIMULATION_TIME, colors="k", linestyles="dashed", label=f"xopt" if i==0 else None)
 
 # plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
-plt.xlim(0, SIMULATION_TIME)
-plt.xlabel("Time, s")
-plt.ylabel(r"$x_{best}$ values")
+ax1.set_xlim(0, SIMULATION_TIME)
+ax1.set_ylabel(r"$x_{best}$ values")
 
-ax2 = ax1.twinx()
-
+ax2 = axs[1]
+ax3 = axs[2]
 # Color lines for each dimension
-colors_1 = plt.cm.rainbow(np.linspace(0, 1, NUM_DIMS))
 # colors_2 = plt.cm.vanimo(np.linspace(0, 1, NUM_DIMS))
 num_samples = centre_values.shape[0]
 every_n = max(1, num_samples // 50)
@@ -497,53 +512,18 @@ for i in range(NUM_DIMS):
     ax2.plot(sim.trange(), centre_values[:, i], color=colors_1[i], linestyle="", marker=".", markersize=1, alpha=0.2,)
     ax2.plot(sim.trange(), np.convolve(centre_values[:,i], np.ones(100)/100, mode='same'), alpha=1.0,
              color=colors_1[i], linestyle="dashed", marker="o", markevery=every_n, label=f"Centre dim {i+1}")
-    ax2.plot(sim.trange(), sim.data[spread_val][:, i], color=colors_1[i], linestyle="", marker=".", markersize=1, alpha=0.2,)
-    ax2.plot(sim.trange(), np.convolve(sim.data[spread_val][:,i], np.ones(100)/100, mode='same'), alpha=1.0,
+    ax3.plot(sim.trange(), sim.data[spread_val][:, i], color=colors_1[i], linestyle="", marker=".", markersize=1, alpha=0.2,)
+    ax3.plot(sim.trange(), np.convolve(sim.data[spread_val][:,i], np.ones(100)/100, mode='same'), alpha=1.0,
              color=colors_1[i], linestyle="dashed", marker="x", markevery=every_n, label=f"Spread dim {i + 1}")
 
-ax2.set_ylabel("Centre and Spread")
+ax2.set_ylabel("Centre value")
+ax3.set_ylabel("Spread value")
 ax2.set_yscale("linear")
+ax3.set_yscale("log")
 
-ax1.legend(loc="upper left", framealpha=0.9)
-ax2.legend(loc="upper right", framealpha=0.9)
+ax3.set_xlabel("Time, s")
+
+ax1.legend(loc="upper right", framealpha=0.9)
+# ax2.legend(loc="upper right", framealpha=0.9)
 
 plt.show()
-
-#%%
-# # Plot the decoded output of the ensemble
-# plt.figure(figsize=(12, 8), dpi=150)
-# # plt.vlines(sim.data[shrink_trigger].nonzero()[0]*sim.dt, -1, 1, colors="grey", linestyles="dashed", label="Shrink", alpha=0.2)
-# plt.plot(sim.trange(), sim.data[ens_lif_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
-# # plt.plot(sim.trange(), sim.data[xbest_val], label=[f"x{i+1}" for i in range(NUM_DIMS)])
-# # plt.plot(sim.trange(), sim.data[input_probe], "r", label="Input")
-# plt.xlim(0, SIMULATION_TIME)
-# plt.legend()
-# plt.show()
-
-#%%
-# Plot the spiking output of the ensemble
-# spikes_cat = []
-# for i, p in enumerate(ea_spk):
-#     spikes = sim.data[p]
-#     # indices = sorted_neurons(motor_ens.ensembles[i], sim, iterations=250)
-#     # spikes_cat.append(spikes[:, indices])
-#     spikes_cat.append(spikes)
-# spikes_cat = np.hstack(spikes_cat)
-
-
-# plt.figure(figsize=(12, 8), dpi=150)
-# spikes_cat = np.hstack([sim.data[p] for p in ea_spk])
-# # rasterplot(sim.trange(), spikes_cat) #, use_eventplot=True)
-# plt.imshow(spikes_cat.T, aspect="auto", cmap="hsv", origin="lower",)
-#
-# t_indices = plt.gca().get_xticks().astype(int)
-# t_indices = t_indices[t_indices >= 0.0]
-# t_indices[-1] -= 1
-# t_labels = [f"{sim.trange()[i]:.1f}" for i in t_indices]
-# plt.xticks(t_indices, t_labels)
-#
-# plt.xlabel("Time, s")
-# plt.ylabel("Neuron")
-# plt.title("Spikes")
-# # plt.xlim(0, SIMULATION_TIME)
-# plt.show()
