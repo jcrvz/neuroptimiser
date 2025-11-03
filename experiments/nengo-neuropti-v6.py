@@ -12,7 +12,7 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 13  # Problem ID from the IOH framework
+PROBLEM_ID      = 10  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_OBJS        = 1   # Number of objectives (only single-objective supported here)
 NUM_DIMS        = 2  # Number of dimensions for the problem
@@ -53,7 +53,7 @@ TAU_1 = TAU_2 = 0.005
 TAU_3           = 0.01
 
 TAU_IMPROV_FAST = 0.02  # 20 ms
-TAU_IMPROV_SLOW = 0.12   # 120 ms
+TAU_IMPROV_SLOW = 0.05   # 120 ms
 K_IMPROV        = 1.0
 P_STAR          = 0.2   # target success rate (CSA-inspired, 1/5 rule)
 ETA_SIG         = 0.3 / np.sqrt(max(3, NUM_DIMS))
