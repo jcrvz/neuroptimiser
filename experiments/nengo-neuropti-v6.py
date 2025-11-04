@@ -10,14 +10,14 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 10  # Problem ID from the IOH framework
+PROBLEM_ID      = 1  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_OBJS        = 1   # Number of objectives (only single-objective supported here)
-NUM_DIMS        = 2  # Number of dimensions for the problem
+NUM_DIMS        = 10  # Number of dimensions for the problem
 
 NEURONS_PER_DIM = 100 * NUM_DIMS
-NEURONS_PER_ENS = 500
-SIMULATION_TIME = 1.0  # seconds
+NEURONS_PER_ENS = 200
+SIMULATION_TIME = 20.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMS)
 problem.reset()
@@ -38,9 +38,6 @@ def eval_obj_func(v_scaled):
 # Exploitation (search-space shrinking) schedule
 EPS             = 1e-12
 
-TAU_0           = 0.001
-TAU_3           = 0.005
-
 TAU_IMPROV_FAST = 0.002  # 5 ms
 TAU_IMPROV_SLOW = 0.010  # 50 ms
 INIT_TIME       = 0.001   # time to initialise the optimiser
@@ -53,13 +50,15 @@ LEAK            = 1.0
 LAMBDA          = 50
 MU              = max(4, LAMBDA // 2)
 SIG_MAX         = 0.5
-SIG_MIN         = 1e-12
+SIG_MIN         = 1e-6
 LOGSIG_MAX      = np.log(SIG_MAX)
 LOGSIG_MIN      = np.log(SIG_MIN)
 SUMLOGSIG       = LOGSIG_MAX + LOGSIG_MIN
 DIFLOGSIG       = LOGSIG_MAX - LOGSIG_MIN
 
-EXPLOIT_WIN     = 0.30  # s
+EXPLOIT_WIN     = 1.0  # s
+# EXPLORE_WIN     = 2.0  # s
+TAU_BLEND       = EXPLOIT_WIN / 4
 
 THRESHOLD_V    = 1e-3
 
@@ -76,40 +75,93 @@ with model:
     state = {
         "lb":               X_LOWER_BOUND.copy(),   # dynamic local bounds
         "ub":               X_UPPER_BOUND.copy(),
-        "best_v":           V_INITIAL_GUESS.copy(),
-        "prev_best_v":      V_INITIAL_GUESS.copy(),
-        "best_f":           F_INITIAL_GUESS,                   # best objective value
-        "prev_best_f":      F_INITIAL_GUESS,                   # previous best objective value
+        "best_v":           None,
+        "prev_best_v":      None,
+        "best_f":           None,                   # best objective value
+        "prev_best_f":      None,                   # previous best objective value
         "smoothed_improv":  1.0,                    # smoothed improvement metric
         "archive":          SortedList(key=lambda _x: _x[1]),       # small archive to represent the sampling phase
-        "t_last_improv":   0.0,                    # time of last improvement
+        "mode":             "explore",             # current mode: explore / exploit
+        "t_mode_switch":    0.0,                    # time of last improvement
         "sigma":            0.25,                    # current spread value
     }
 
     # DEFINE THE MAIN COMPONENTS
     # --------------------------------------------------------------
-    # def improve_gate_func(t, fvals):
-    #     # Extract best and previous best objective values
-    #     curr_f      = fvals[0]
-    #     best_f      = fvals[1]
-    #
-    #     if best_f - curr_f > EPS:
-    #         return 1.0
-    #
-    #     return 0.0
-    #
-    # improve_gate_node = nengo.Node(
-    #     label       = "Improve Gate",
-    #     output      = improve_gate_func,
-    #     size_in     = 2 * NUM_OBJS,
-    #     size_out    = 1,
-    # )
+    def _mode_update_func(t, _feature):
+        if t < INIT_TIME:
+            state["mode"] = "explore"
+            state["t_mode_switch"] = t
+            return 0.0
+
+        time_since_switch = t - state["t_mode_switch"]
+
+        if state["mode"] == "explore":
+            # Only switch TO exploit when feature triggers
+            if _feature > 0.0:  # Threshold for significant improvement
+                state["mode"] = "exploit"
+                state["t_mode_switch"] = t
+                return 1.0
+            return 0.0
+
+
+        else:  # mode == "exploit"
+            if time_since_switch > EXPLOIT_WIN:
+                state["mode"] = "explore"
+                state["t_mode_switch"] = t
+
+                # OXYGENATE: Keep top 50%, inject 25% random
+                if len(state["archive"]) > MU:
+                    keep_size = len(state["archive"]) // 2
+                    elite = list(state["archive"][:keep_size])
+                    state["archive"].clear()
+
+                    # Keep elite
+                    for item in elite:
+                        state["archive"].add(item)
+                    # Inject random samples for diversity
+                    for _ in range(keep_size // 2):
+                        random_v = np.random.uniform(-0.7, 0.7, NUM_DIMS)
+                        random_f = eval_obj_func(random_v)
+                        state["archive"].add((random_v, random_f))
+                return 0.0
+            return 1.0
+
+
+    mode_gate_node = nengo.Node(
+        label       = "Mode Gate",
+        output      = _mode_update_func,
+        size_in     = 1,
+        size_out    = 1,
+    )
 
     # Gate noise by the improvement pulse: B_effective = (1 - gate) * noise
     def _noise_gate_func(t, feature):
-        if (t - state["t_last_improv"]) < EXPLOIT_WIN or t < INIT_TIME:
+        if t < INIT_TIME:
             return np.zeros(NUM_DIMS)
 
+        if state["mode"] == "exploit":
+            if len(state["archive"]) >= 4:
+                k = min(MU, len(state["archive"]))
+                elite = np.array([v for v, _ in state["archive"][:k]])
+
+                mean = np.mean(elite, axis=0)
+                centered = elite - mean
+                cov = (centered.T @ centered) / (k - 1)
+
+                # Stronger regularization: blend with isotropic
+                iso_cov = 0.1 * np.eye(NUM_DIMS)  # 10% isotropic component
+                cov = 0.7 * cov + 0.3 * iso_cov  # 70/30 blend
+
+                try:
+                    L = np.linalg.cholesky(cov)
+                    return L @ np.random.normal(0.0, 1.0, NUM_DIMS)
+                except np.linalg.LinAlgError:
+                    return 0.3 * np.random.normal(0.0, 1.0, NUM_DIMS)  # Larger fallback
+            else:
+                return 0.3 * np.random.normal(0.0, 1.0, NUM_DIMS)
+
+        # Exploration: isotropic
         return np.random.normal(0.0, 1.0, NUM_DIMS)
 
     noise_gate = nengo.Node(
@@ -124,12 +176,13 @@ with model:
         if t < INIT_TIME:
             return np.ones(NUM_DIMS)
 
-        if (t - state["t_last_improv"]) < EXPLOIT_WIN:
+        if _improv_rate > 0.0:
             return -1.0 * np.ones(NUM_DIMS)
+
         spreads = np.clip(_improv_rate, 0.0, 1.0)
 
         # Adapt spread based on improvement rate
-        amgis = 1.0 - 2.0 * spreads
+        amgis = 1.0 - 2.0 * spreads ** 2
 
         return amgis * np.ones(NUM_DIMS)
 
@@ -148,26 +201,64 @@ with model:
 
         return 1.0 / (1.0 + np.exp(-6.0 * (x - 0.5)))
 
-    # Centre target node
-    def centre_target_func(t, improv_rate):
-        if t < INIT_TIME:
+    # Centre selection
+    def centre_selector_func(t, vv):
+        exploit_centre = vv[:NUM_DIMS]
+        explore_centre = vv[NUM_DIMS:]
+
+        time_in_mode = t - state["t_mode_switch"]
+        alpha = np.clip(time_in_mode / TAU_BLEND, 0.0, 1.0)
+
+        if state["mode"] == "exploit":
+            # Blend FROM explore TO exploit
+            return (1.0 - alpha) * explore_centre + alpha * exploit_centre
+        else:
+            # Stay at explore centre
+            return explore_centre
+
+
+    centre_selector_node = nengo.Node(
+        label       = "Centre Selector",
+        output      = centre_selector_func,
+        size_in     = 2 * NUM_DIMS,
+        size_out    = NUM_DIMS,
+    )
+
+    # Centre for exploitation node
+    def centre_exploit_func(t):
+        if state["best_v"] is None:
+            return V_INITIAL_GUESS.copy()
+        return state["best_v"]
+
+    centre_exploit_node = nengo.Node(
+        label       = "Centre for Exploitation",
+        output      = centre_exploit_func,
+        # size_in     = 1,
+        size_out    = NUM_DIMS,
+    )
+
+    # Centre for exploration node
+    def centre_explore_func(t, improv_rate):
+        if t < INIT_TIME or not state["archive"]:
             return V_INITIAL_GUESS.copy()
 
-        if not state["archive"] or (t - state["t_last_improv"]) < EXPLOIT_WIN:
-            return state["best_v"]
+        k = max(2, min(MU, len(state["archive"]) // 2))
+        elite = np.array([v for v, _ in state["archive"][:k]])
+        centroid = np.mean(elite, axis=0)
 
-        # Compute the centroid of the top-mu solutions
-        mu          = max(2, min(MU, len(state["archive"]) // 2))
-        elite       = np.array([v for v,_ in state["archive"][:mu]])
-        centroid   = np.mean(elite, axis=0)
+        # OXYGENATE: Stronger, longer-lasting perturbation
+        if state["mode"] == "explore":
+            time_since_switch = t - state["t_mode_switch"]
+            mutation_strength = 0.6 * np.exp(-time_since_switch / 2.0)  # 60%, 2s decay
+            mutation = np.random.uniform(-mutation_strength, mutation_strength, NUM_DIMS)
+            centroid = np.clip(centroid + mutation, -1.0, 1.0)
 
-        # Blend between best-so-far and centroid based on success rate
-        # return improv_rate * state["best_v"] + (1.0 - improv_rate) * centroid
-        return centroid
+        weight = np.clip(improv_rate, 0.0, 1.0)
+        return weight * centroid + (1.0 - weight) * V_INITIAL_GUESS
 
-    centre_target_node = nengo.Node(
-        label       = "Centre Target",
-        output      = centre_target_func,
+    centre_explore_node = nengo.Node(
+        label       = "Centre for Exploration",
+        output      = centre_explore_func,
         size_in     = 1,
         size_out    = NUM_DIMS,
     )
@@ -207,10 +298,10 @@ with model:
 
     # OBJECTIVE FUNCTION NODE: Evaluate the objective function
     def objective_func(t, variables):
-        if t < INIT_TIME:
-            v   = V_INITIAL_GUESS.copy()
-            fv  = eval_obj_func(v)
-            return  np.concatenate((v, [fv]))
+        # if t < INIT_TIME:
+        #     v   = V_INITIAL_GUESS.copy()
+        #     fv  = eval_obj_func(v)
+        #     return  np.concatenate((v, [fv]))
 
         v   = np.clip(variables, -1.0, 1.0)
         fv  = eval_obj_func(v)
@@ -225,28 +316,21 @@ with model:
 
     # SELECTOR NODE: Keep track of best-so-far solution
     def selector_func(t, vf):
-        if t < INIT_TIME:
-            return np.concatenate((state["best_v"], [state["best_f"]]))
+        v = vf[:NUM_DIMS]
+        fv = float(vf[NUM_DIMS])
 
-        # Extract candidate solution and its objective value
-        v       = vf[:NUM_DIMS]
-        fv      = float(vf[NUM_DIMS])
-
-        # Archive update
         state["archive"].add((v.copy(), fv))
-
-        # Keep archive size limited
         if len(state["archive"]) > LAMBDA:
             state["archive"].pop()
 
-        # Update improvement metrics
-        if fv < state["best_f"]:
-            state["prev_best_f"]    = state["best_f"] if state["best_f"] is not None else fv
-            state["best_v"]         = v.copy()
-            state["best_f"]         = fv
-
+        # Initialize on first evaluation
+        if state["best_f"] is None or fv < state["best_f"]:
+            state["prev_best_f"] = state["best_f"]
+            state["best_v"] = v.copy()
+            state["best_f"] = fv
 
         return np.concatenate((state["best_v"], [state["best_f"]]))
+
 
     selector_node   = nengo.Node(
         label       = "Selector",
@@ -257,19 +341,14 @@ with model:
 
     # Features node
     def features_func(t, _difff):
-        if t < INIT_TIME:
-            return 1.0
+        feature_value = np.clip(_difff, 0.0, 1.0)
 
-        # If improvement occurred, update state
-        if _difff > 0.0:
-            state["t_last_improv"] = t
-            # fast growth towards 1.0 when improvement occurs
-            val_f   = 0.1 + 0.9 * (1.0 - np.exp(-50.0 * _difff))
-        else:
-            val_f   = 0.0
+        # If improvement occurs DURING exploitation, reset timer
+        if feature_value > 0.0 and state["mode"] == "exploit":
+            state["t_mode_switch"] = t  # Extend exploitation window
 
-        # return features
-        return np.clip(val_f, -1.0, 1.0)
+        return feature_value
+
 
     features_input_node = nengo.Node(
         label       = "Features Gate",
@@ -291,19 +370,20 @@ with model:
         radius      = 1.1,
     )
 
-    # INITIALISATION CONNECTIONS
+    # CONNECT THE COMPONENTS
     # --------------------------------------------------------------
-    # nengo.Connection(init_node, centre_target_node[:NUM_DIMS], synapse=None)
-    # nengo.Connection(init_node, spread_target_node[:NUM_DIMS], synapse=None)
-    # nengo.Connection(init_node, neuromodulator_ens, synapse=None)
+
 
     # CENTRE CONTROL LOOP
     # --------------------------------------------------------------
-    # Compute error between target and current centre
-    nengo.Connection(neuromodulator_ens, centre_target_node[:NUM_DIMS], synapse=0.0)
-    nengo.Connection(neuromodulator_ens, spread_target_node[:NUM_DIMS], synapse=0.0)
+    nengo.Connection(centre_exploit_node, centre_selector_node[:NUM_DIMS], synapse=0.0)
+    nengo.Connection(centre_explore_node, centre_selector_node[NUM_DIMS:], synapse=0.0)
 
-    nengo.Connection(centre_target_node, motor_centre, synapse=None)
+    # Compute error between target and current centre
+    nengo.Connection(neuromodulator_ens, centre_explore_node, synapse=0.0)
+    nengo.Connection(mode_gate_node, spread_target_node[:NUM_DIMS], synapse=0.0)
+
+    nengo.Connection(centre_selector_node, motor_centre, synapse=None)
     nengo.Connection(spread_target_node, motor_amgis, synapse=None,
                      transform=np.eye(NUM_DIMS))
 
@@ -311,14 +391,59 @@ with model:
     # --------------------------------------------------------------
     # Noise and scale
 
-    def amgisIIsigma(_amgis):
-        _amgis          = np.clip(_amgis, -1.0, 1.0)
-        _log_sigma  = 0.5 * (DIFLOGSIG * _amgis + SUMLOGSIG)
-        return np.clip(np.exp(_log_sigma), SIG_MIN, SIG_MAX)
+    # Direct sigma control
+    motor_sigma = nengo.Ensemble(
+        label="Motor Sigma",
+        n_neurons=NEURONS_PER_DIM,
+        dimensions=NUM_DIMS,
+        radius=SIG_MAX,
+        encoders=nengo.dists.Choice([[1] * NUM_DIMS]),  # Only positive encoders
+    )
 
-    nengo.Connection(motor_amgis, mult_spread_noise.A, synapse=None,
-                     function=amgisIIsigma)
-    nengo.Connection(neuromodulator_ens, noise_gate, synapse=None)
+
+    def sigma_target_func(t, improv_rate):
+        if t < INIT_TIME:
+            return 0.5 * np.ones(NUM_DIMS)
+
+        if state["mode"] == "exploit":
+            return 0.0005 * np.ones(NUM_DIMS)
+
+        # OXYGENATE: Larger, longer-lasting boost
+        time_since_switch = t - state["t_mode_switch"]
+        boost_magnitude = 0.5  # 50% boost (was 20%)
+        boost_duration = 2.0  # 2s decay (was 0.5s)
+        boost = boost_magnitude * np.exp(-time_since_switch / boost_duration)
+
+        # Floor sigma to prevent total collapse
+        base_sigma = np.clip(state["sigma"], 0.05, SIG_MAX)  # min 5% spread
+
+        return (base_sigma + boost) * np.ones(NUM_DIMS)
+
+    sigma_target_node = nengo.Node(
+        label="Sigma Target",
+        output=sigma_target_func,
+        size_in=1,
+        size_out=NUM_DIMS,
+    )
+
+
+    def mode_probe_func(t):
+        return 1.0 if state["mode"] == "exploit" else 0.0
+
+
+    mode_probe_node = nengo.Node(
+        label="Mode Probe",
+        output=mode_probe_func,
+    )
+
+
+    nengo.Connection(sigma_target_node, motor_sigma, synapse=TAU_BLEND)
+    nengo.Connection(motor_sigma, mult_spread_noise.A, synapse=None)
+
+    # nengo.Connection(neuromodulator_ens, noise_gate, synapse=None)
+    nengo.Connection(features_input_node, mode_gate_node, synapse=None)
+    nengo.Connection(mode_gate_node, noise_gate, synapse=None)
+
     nengo.Connection(noise_gate,              mult_spread_noise.B, synapse=None)
 
 
@@ -355,6 +480,9 @@ with model:
     spread_val      = nengo.Probe(mult_spread_noise.A,       synapse=0.0)
     # features_val    = nengo.Probe(neuromodulator_ens,   synapse=0.0)
     features_val    = nengo.Probe(features_input_node,   synapse=0.0)
+
+    mode_val = nengo.Probe(mode_probe_node, synapse=0.0)
+
 
 #%%
 # Create our simulator
@@ -411,9 +539,10 @@ centre_values   = sim.data[centre_val]
 centre_scaled = np.clip(centre_values, -1.0, 1.0)
 f_centre = np.array([eval_obj_func(centre_scaled[i,:]) for i in range(centre_scaled.shape[0])])
 
-plt.plot(sim.trange(), f_centre - problem.optimum.y, "g", marker=".", markersize=1, alpha=0.25)
-f_centre_smooth = np.convolve(f_centre, np.ones(100)/100, mode='same')
-plt.plot(sim.trange(), f_centre_smooth - problem.optimum.y, "g--", label="Centre error")
+# [centre plot]
+# plt.plot(sim.trange(), f_centre - problem.optimum.y, "g", marker=".", markersize=1, alpha=0.25)
+# f_centre_smooth = np.convolve(f_centre, np.ones(100)/100, mode='same')
+# plt.plot(sim.trange(), f_centre_smooth - problem.optimum.y, "g--", label="Centre error")
 
 # add second axis for centre and spread
 ax1 = plt.gca()
@@ -423,7 +552,17 @@ plt.ylabel("Objective value error")
 plt.yscale("log")
 plt.legend(loc="lower left")
 
+# Highlight exploitation phases
+mode_signal = sim.data[mode_val][:,0]
+exploit_mask = mode_signal > 0.5
+for i in range(len(exploit_mask) - 1):
+    if exploit_mask[i]:
+        plt.axvspan(sim.trange()[i], sim.trange()[i+1],
+                    color='yellow', alpha=0.05, zorder=-1)
+
 ax2 = ax1.twinx()
+ax2.plot(sim.trange(), mode_signal, "y:", linewidth=2.0, alpha=0.3, label="Exploit mode")
+
 # ax2.plot(sim.trange(), np.average(sim.data[centre_val], axis=1), "g--", label="Centre")
 # ax2.plot(sim.trange(), np.exp(np.average(sim.data[spread_val], axis=1)), "m--", label="Spread")
 
