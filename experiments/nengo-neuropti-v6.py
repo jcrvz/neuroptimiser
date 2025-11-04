@@ -15,8 +15,8 @@ PROBLEM_INS     = 1  # Problem instance
 NUM_OBJS        = 1   # Number of objectives (only single-objective supported here)
 NUM_DIMS        = 2  # Number of dimensions for the problem
 
-NEURONS_PER_DIM = 20 * NUM_DIMS
-NEURONS_PER_ENS = 100
+NEURONS_PER_DIM = 100 * NUM_DIMS
+NEURONS_PER_ENS = 500
 SIMULATION_TIME = 1.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMS)
@@ -41,8 +41,8 @@ EPS             = 1e-12
 TAU_0           = 0.001
 TAU_3           = 0.005
 
-TAU_IMPROV_FAST = 0.001  # 5 ms
-TAU_IMPROV_SLOW = 0.002  # 50 ms
+TAU_IMPROV_FAST = 0.002  # 5 ms
+TAU_IMPROV_SLOW = 0.010  # 50 ms
 INIT_TIME       = 0.001   # time to initialise the optimiser
 K_IMPROV        = 10.0
 P_STAR          = 0.5   # target success rate (CSA-inspired, 1/5 rule)
@@ -59,7 +59,7 @@ LOGSIG_MIN      = np.log(SIG_MIN)
 SUMLOGSIG       = LOGSIG_MAX + LOGSIG_MIN
 DIFLOGSIG       = LOGSIG_MAX - LOGSIG_MIN
 
-EXPLOIT_WIN     = 0.01  # s
+EXPLOIT_WIN     = 0.30  # s
 
 THRESHOLD_V    = 1e-3
 
@@ -120,13 +120,13 @@ with model:
     )
 
     # Spread target node
-    def spread_target_func(t, _improv_rates):
+    def spread_target_func(t, _improv_rate):
         if t < INIT_TIME:
             return np.ones(NUM_DIMS)
 
         if (t - state["t_last_improv"]) < EXPLOIT_WIN:
             return -1.0 * np.ones(NUM_DIMS)
-        spreads = np.clip(_improv_rates, 0.0, 1.0)
+        spreads = np.clip(_improv_rate, 0.0, 1.0)
 
         # Adapt spread based on improvement rate
         amgis = 1.0 - 2.0 * spreads
@@ -137,7 +137,7 @@ with model:
     spread_target_node = nengo.Node(
         label       = "Spread Target",
         output      = spread_target_func,
-        size_in     = NUM_DIMS,
+        size_in     = 1,
         size_out    = NUM_DIMS,
     )
 
@@ -149,7 +149,7 @@ with model:
         return 1.0 / (1.0 + np.exp(-6.0 * (x - 0.5)))
 
     # Centre target node
-    def centre_target_func(t, improv_rates):
+    def centre_target_func(t, improv_rate):
         if t < INIT_TIME:
             return V_INITIAL_GUESS.copy()
 
@@ -168,7 +168,7 @@ with model:
     centre_target_node = nengo.Node(
         label       = "Centre Target",
         output      = centre_target_func,
-        size_in     = NUM_DIMS,
+        size_in     = 1,
         size_out    = NUM_DIMS,
     )
 
@@ -255,94 +255,53 @@ with model:
         size_out    = NUM_DIMS + NUM_OBJS,
     )
 
-    # FEATURES ENSEMBLE: Extract features from the current evaluation
-
-    # def _feat_stagnation_rate(t):
-    #     if state["prev_best_f"] is None:
-    #         return 0.0
-    #     time_since  = max(EPS, t - state["t_last_improv"])
-    #     stag_rate   = (time_since / STAG_WAIT) ** 3
-    #     return stag_rate
-
-    # def _feat_success_rate(t):
-    #     if len(state["archive"]) < 2:
-    #         return 0.5
-    #
-    #     f_values = [fv for _, fv in state["archive"]]
-    #     median_f = np.median(f_values)
-    #     num_success = np.sum(f_values < median_f)
-    #     return num_success / len(f_values)
-
-    # def _feat_fitness_diversity(t):
-    #     if len(state["archive"]) < 2:
-    #         return 0.0
-    #
-    #     mu      = max(2, min(MU, len(state["archive"]) // 2))
-    #     elite_f = [fv for _, fv in state["archive"][:mu]]
-    #
-    #     std_eli = np.std(elite_f)
-    #     mean_eli= np.mean(elite_f) + EPS
-    #
-    #     return std_eli / mean_eli
-
     # Features node
-    def features_func(t, _diff_vf):
+    def features_func(t, _difff):
         if t < INIT_TIME:
-            return np.ones(NUM_DIMS)
-
-        # _curr_prev_vf = [curr_v, curr_f, prev_v, prev_f]
-        _diffv  = _diff_vf[:NUM_DIMS]
-        _difff  = _diff_vf[NUM_DIMS: NUM_DIMS + NUM_OBJS]
+            return 1.0
 
         # If improvement occurred, update state
         if _difff > 0.0:
             state["t_last_improv"] = t
             # fast growth towards 1.0 when improvement occurs
-            val_f   = 1.0 #0.1 + 0.9 * (1.0 - np.exp(-50.0 * _rel_improf))
+            val_f   = 0.1 + 0.9 * (1.0 - np.exp(-50.0 * _difff))
         else:
             val_f   = 0.0
 
-        # Compute difference in solution vectors
-        vals_v       = val_f * _diffv
-
-        # Assemble features
-        # vals        = np.concatenate((val_v, [val_f]))
-
         # return features
-        return np.clip(vals_v, -1.0, 1.0)
+        return np.clip(val_f, -1.0, 1.0)
 
     features_input_node = nengo.Node(
         label       = "Features Gate",
         output      = features_func,
-        size_in     = NUM_DIMS + NUM_OBJS,
-        size_out    = NUM_DIMS,
+        size_in     = NUM_OBJS,
+        size_out    = 1,
     )
 
-    init_node = nengo.Node(
-        label       = "Initialiser",
-        output      = lambda t: np.ones(NUM_DIMS) if t < INIT_TIME else np.zeros(NUM_DIMS),
-    )
+    # init_node = nengo.Node(
+    #     label       = "Initialiser",
+    #     output      = lambda t: 1.0 if t < INIT_TIME else 0.0,
+    # )
 
     # Features ensemble to extract features for utility computation
-    neuromodulator_ens = nengo.networks.EnsembleArray(
+    neuromodulator_ens = nengo.Ensemble(
         label       = "Neuromodulator",
         n_neurons   = NEURONS_PER_ENS,
-        n_ensembles = NUM_DIMS,
-        ens_dimensions = 1,
+        dimensions  = 1,
         radius      = 1.1,
     )
 
     # INITIALISATION CONNECTIONS
     # --------------------------------------------------------------
-    nengo.Connection(init_node, centre_target_node[:NUM_DIMS], synapse=None)
-    nengo.Connection(init_node, spread_target_node[:NUM_DIMS], synapse=None)
-    nengo.Connection(init_node, neuromodulator_ens.input, synapse=None)
+    # nengo.Connection(init_node, centre_target_node[:NUM_DIMS], synapse=None)
+    # nengo.Connection(init_node, spread_target_node[:NUM_DIMS], synapse=None)
+    # nengo.Connection(init_node, neuromodulator_ens, synapse=None)
 
     # CENTRE CONTROL LOOP
     # --------------------------------------------------------------
     # Compute error between target and current centre
-    nengo.Connection(neuromodulator_ens.output, centre_target_node[:NUM_DIMS], synapse=0.0)
-    nengo.Connection(neuromodulator_ens.output, spread_target_node[:NUM_DIMS], synapse=0.0)
+    nengo.Connection(neuromodulator_ens, centre_target_node[:NUM_DIMS], synapse=0.0)
+    nengo.Connection(neuromodulator_ens, spread_target_node[:NUM_DIMS], synapse=0.0)
 
     nengo.Connection(centre_target_node, motor_centre, synapse=None)
     nengo.Connection(spread_target_node, motor_amgis, synapse=None,
@@ -359,7 +318,7 @@ with model:
 
     nengo.Connection(motor_amgis, mult_spread_noise.A, synapse=None,
                      function=amgisIIsigma)
-    nengo.Connection(neuromodulator_ens.output[-1], noise_gate, synapse=None)
+    nengo.Connection(neuromodulator_ens, noise_gate, synapse=None)
     nengo.Connection(noise_gate,              mult_spread_noise.B, synapse=None)
 
 
@@ -377,13 +336,13 @@ with model:
 
     # NEUROMODULATION (FEATURE INPUTS)
     # --------------------------------------------------------------
-    nengo.Connection(selector_node, features_input_node,
+    nengo.Connection(selector_node[-1], features_input_node,
                      synapse=TAU_IMPROV_SLOW, transform=+K_IMPROV)
-    nengo.Connection(selector_node, features_input_node,
+    nengo.Connection(selector_node[-1], features_input_node,
                      synapse=TAU_IMPROV_FAST, transform=-K_IMPROV)
 
     # Keep stagnation/other feature on channel 1
-    nengo.Connection(features_input_node, neuromodulator_ens.input, synapse=None)
+    nengo.Connection(features_input_node, neuromodulator_ens, synapse=None)
 
     # PROBES
     # --------------------------------------------------------------
@@ -452,7 +411,7 @@ centre_values   = sim.data[centre_val]
 centre_scaled = np.clip(centre_values, -1.0, 1.0)
 f_centre = np.array([eval_obj_func(centre_scaled[i,:]) for i in range(centre_scaled.shape[0])])
 
-# plt.plot(sim.trange(), f_centre - problem.optimum.y, "g", marker=".", markersize=1, alpha=0.25)
+plt.plot(sim.trange(), f_centre - problem.optimum.y, "g", marker=".", markersize=1, alpha=0.25)
 f_centre_smooth = np.convolve(f_centre, np.ones(100)/100, mode='same')
 plt.plot(sim.trange(), f_centre_smooth - problem.optimum.y, "g--", label="Centre error")
 
@@ -468,14 +427,15 @@ ax2 = ax1.twinx()
 # ax2.plot(sim.trange(), np.average(sim.data[centre_val], axis=1), "g--", label="Centre")
 # ax2.plot(sim.trange(), np.exp(np.average(sim.data[spread_val], axis=1)), "m--", label="Spread")
 
-colors_1 = plt.cm.rainbow(np.linspace(0, 1, NUM_DIMS))
-for i in range(NUM_DIMS):
-    improv_rate = sim.data[features_val][:,i]
-    # succes_rate = sim.data[features_val][:,1]
-    ax2.plot(sim.trange(), improv_rate, color=colors_1[i], marker=".", markersize=1, linestyle="", alpha=0.2)
-    ax2.plot(sim.trange(), np.convolve(improv_rate, np.ones(100)/100, mode='same'), linestyle="dashed", color=colors_1[i], label=f"Dim {i+1}")
-    # ax2.plot(sim.trange(), succes_rate, "r", marker=".", markersize=1, linestyle="", alpha=0.2)
-    # ax2.plot(sim.trange(), np.convolve(succes_rate, np.ones(100)/100, mode='same'), "r--", label="Stag. Rate")
+NUM_FEATURES = 1
+colors_1 = plt.cm.rainbow(np.linspace(0, 1, NUM_FEATURES))
+# for i in range(NUM_FEATURES):
+improv_rate = sim.data[features_val][:,0]
+# succes_rate = sim.data[features_val][:,1]
+ax2.plot(sim.trange(), improv_rate, color="magenta", marker=".", markersize=1, linestyle="dashed", alpha=0.5, label="Feature"), #f"Dim {i+1}")
+# ax2.plot(sim.trange(), np.convolve(improv_rate, np.ones(100)/100, mode='same'), linestyle="dashed", color=colors_1[i], label=f"Dim {i+1}")
+# ax2.plot(sim.trange(), succes_rate, "r", marker=".", markersize=1, linestyle="", alpha=0.2)
+# ax2.plot(sim.trange(), np.convolve(succes_rate, np.ones(100)/100, mode='same'), "r--", label="Stag. Rate")
 
 
 ax2.set_ylabel("Improvement rate")
@@ -508,7 +468,7 @@ ax3 = axs[2]
 # colors_2 = plt.cm.vanimo(np.linspace(0, 1, NUM_DIMS))
 num_samples = centre_values.shape[0]
 every_n = max(1, num_samples // 50)
-for i in range(NUM_DIMS):
+for i in range(NUM_FEATURES):
     ax2.plot(sim.trange(), centre_values[:, i], color=colors_1[i], linestyle="", marker=".", markersize=1, alpha=0.2,)
     ax2.plot(sim.trange(), np.convolve(centre_values[:,i], np.ones(100)/100, mode='same'), alpha=1.0,
              color=colors_1[i], linestyle="dashed", marker="o", markevery=every_n, label=f"Centre dim {i+1}")
