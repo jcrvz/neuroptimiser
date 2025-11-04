@@ -10,7 +10,7 @@ from neuroptimiser.utils import tro2s, trs2o
 
 #%%
 
-PROBLEM_ID      = 1  # Problem ID from the IOH framework
+PROBLEM_ID      = 10  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_OBJS        = 1   # Number of objectives (only single-objective supported here)
 NUM_DIMS        = 2  # Number of dimensions for the problem
