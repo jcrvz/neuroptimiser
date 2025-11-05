@@ -14,8 +14,8 @@ from neuroptimiser.utils import tro2s, trs2o
 PROBLEM_ID      = 1  # Problem ID from the IOH framework
 PROBLEM_INS     = 1  # Problem instance
 NUM_DIMENSIONS  = 10  # Number of dimensions for the problem
-NEURONS_PER_DIM = 100
-SIMULATION_TIME = 5.0  # seconds
+NEURONS_PER_DIM = 50
+SIMULATION_TIME = 50.0  # seconds
 
 problem         = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMENSIONS)
 problem.reset()
@@ -37,11 +37,11 @@ X_UPPER_BOUND0  = X_UPPER_BOUND.copy()
 # Exploitation (search-space shrinking) schedule
 SEED_VALUE      = 69
 INIT_TIME       = 0.002     # seconds before starting shrink operations
-DEFAULT_WAIT    = 0.025     # seconds between shrink operations
-STAG_RESET      = 0.050     # seconds of stagnation before a RESET to global bounds
+DEFAULT_WAIT    = 0.10     # seconds between shrink operations
+STAG_RESET      = 0.20     # seconds of stagnation before a RESET to global bounds
 RESET_WAIT      = 0.10
 EPS             = 1e-12   # small value to ensure numerical ordering of bounds
-MIN_WIDTH       = 1e-3   # do not shrink any dimension below this absolute width
+MIN_WIDTH       = 1e-3   # do not shrink any dimension below this absolute width proportion
 ACTION_DELAY    = 0.00  # seconds to retarget the EA to the best_v after a shrink
 TAU             = 0.002  # synaptic time constant for filtering inputs
 # MIN_WIDTH_FRAC   = 0.02    # do not shrink any dimension below 2% of the original rang
@@ -88,11 +88,12 @@ with model:
         n_neurons       = NEURONS_PER_DIM,
         n_ensembles     = NUM_DIMENSIONS,
         ens_dimensions  = 1,
-        radius          = 2.1,
-        intercepts  = nengo.dists.Uniform(-0.9, 0.9),
-        # max_rates   = nengo.dists.Uniform(100,220),
+        radius          = 1.1,
+        # intercepts  = nengo.dists.Uniform(-0.9, 0.9),
+        max_rates   = nengo.dists.Uniform(100,220),
         encoders    = nengo.dists.UniformHypersphere(surface=True),
         neuron_type     = nengo.AdaptiveLIF(),
+        # neuron_type     = nengo.LIF(),
         seed            = SEED_VALUE,
     )
 
@@ -113,10 +114,19 @@ with model:
 
     # Selector / controller node to move towards the best-so-far
     eta = 0.6  # "Learning rate"
+
+
     def hs(t, v):
-        direction   = state["best_v"] - v
-        noise       = 0.05 * state["width_proportion"] * np.random.randn(NUM_DIMENSIONS)
-        return v + eta * (direction + noise)
+        direction = state["best_v"] - v
+
+        # Only add noise when search space is wide (early exploration)
+        if state["width_proportion"] > 0.3:
+            noise = 0.05 * state["width_proportion"] * np.random.randn(NUM_DIMENSIONS)
+        else:
+            noise = 0  # Pure exploitation when converged
+
+        return eta * direction + noise
+
 
     hs_node     = nengo.Node(
         label       = "hs",
@@ -131,10 +141,9 @@ with model:
             state["t_stag_start"] = t
             state["last_best_f"] = state["best_f"]
 
-        stagnated   = (t - state["t_stag_start"]) >= STAG_RESET
-        can_reset   = (t - state["last_reset_time"]) >= RESET_WAIT
+        stagnated = (t - state["t_stag_start"]) >= STAG_RESET
+        can_reset = (t - state["last_reset_time"]) >= RESET_WAIT
 
-        # Trigger every wait_time seconds after a short warmup
         if (state["best_v"] is None) or (t < INIT_TIME) or (
                 (t - state["last_adjust"] < DEFAULT_WAIT)):
             return state["width_proportion"]
@@ -158,49 +167,37 @@ with model:
             new_ub = V_UPPER_BOUND.copy()
             state["width_proportion"] = 1.0
 
-            # Recompute best_v under the RESET bounds
-            if state["best_v"] is not None:
-                new_best_v          = trs2o(state["best_v"], state["lb"], state["ub"])
-            else:
-                new_best_v          = trs2o(V_INITIAL_GUESS, state["lb"], state["ub"])
-            # new_best_v          = np.random.uniform(V_LOWER_BOUND, V_UPPER_BOUND, NUM_DIMENSIONS)
-            # # new_best_v          = V_INITIAL_GUESS.copy()
-            # state["best_v"]     = new_best_v
-            # state["best_f"]     = F_INITIAL_GUESS
+            # new_best_v = np.random.uniform(V_LOWER_BOUND, V_UPPER_BOUND, NUM_DIMENSIONS)
+            # state["best_v"] = new_best_v.copy()
+            # state["best_f"] = None  # Force re-evaluation after reset
+            new_best_v = state["best_v"]
 
-            state["last_reset_time"]= t
-            state["last_adjust"]    = t
-            state["t_stag_start"]   = t
-
+            state["last_reset_time"] = t
+            state["last_adjust"] = t
+            state["t_stag_start"] = t
         else:
             # Current widths and target widths after shrinking
             half_width  = 0.5 * np.maximum(
                 (state["ub"] - state["lb"]) * proportion,  MIN_WIDTH
             )
 
-            # Center the new box around the current best (in original space)
-            new_best_v  = state["best_v"]
+            new_best_v = state["best_v"]
 
-            # Enforce minimum width and clip to global box
-            new_lb      = np.maximum(new_best_v - half_width, V_LOWER_BOUND)
-            new_ub      = np.minimum(new_best_v + half_width, V_UPPER_BOUND)
+            new_lb = np.maximum(new_best_v - half_width, V_LOWER_BOUND)
+            new_ub = np.minimum(new_best_v + half_width, V_UPPER_BOUND)
 
-            # Ensure numerical ordering
-            new_lb      = np.minimum(new_lb, new_ub - EPS)
-            new_ub      = np.maximum(new_ub, new_lb + EPS)
+            new_lb = np.minimum(new_lb, new_ub - EPS)
+            new_ub = np.maximum(new_ub, new_lb + EPS)
 
             state["width_proportion"]   *= proportion
             state["last_adjust"]        = t
             state["t_stag_start"]       = t
 
-        # Update the local state
-        state["lb"], state["ub"]    = new_lb, new_ub
-        state["best_v"]             = np.clip(new_best_v, -1.0, 1.0)
-        # state["retarget_until"]     = t + ACTION_DELAY
-
-        # print(t, state["lb"], state["ub"], state["width_proportion"], flush=True)
+        state["lb"], state["ub"] = new_lb, new_ub
+        state["best_v"] = np.clip(new_best_v, -1.0, 1.0)
 
         return state["width_proportion"]
+
 
     # Scheduler node to trigger shrink operations
     shrink_node = nengo.Node(
@@ -226,7 +223,7 @@ with model:
             state["best_v"] = v.copy()
 
             # Reset stagnation counter
-            state["archive"].add( (v.copy(), [fv]) )
+            state["archive"].add( (v.copy(), fv) )
 
             if len(state["archive"]) > ARCH_LENGTH:
                 state["archive"].pop()
@@ -234,7 +231,8 @@ with model:
         if len(state["archive"]) == 0:
             return np.concatenate((v, [fv]))
         else:
-            return np.concatenate(state["archive"][0])
+            best_archive_v, best_archive_f = state["archive"][0]
+            return np.concatenate((best_archive_v, [best_archive_f]))
 
     selector_node   = nengo.Node(
         label       = "selector",
@@ -350,20 +348,21 @@ change_proportions = np.diff(action_proportions)
 change_indices = np.where(change_proportions != 0)[0]
 
 def add_colors():
-    # Indices where the action proportion changes
-    for idx in change_indices:
-        delta = change_proportions[idx]
-        t = action_times[idx + 1]
-        if delta < 0:
-            color   = "red"
-            marker  = "v"
-        elif delta == 0:
-            color   = "black"
-            marker  = "o"
-        else:
-            color   = "blue"
-            marker  = "^"
-        plt.axvline(t, color=color, alpha=0.3, linestyle="--", marker=marker)
+    pass
+    # # Indices where the action proportion changes
+    # for idx in change_indices:
+    #     delta = change_proportions[idx]
+    #     t = action_times[idx + 1]
+    #     if delta < 0:
+    #         color   = "red"
+    #         marker  = "v"
+    #     elif delta == 0:
+    #         color   = "black"
+    #         marker  = "o"
+    #     else:
+    #         color   = "blue"
+    #         marker  = "^"
+    #     plt.axvline(t, color=color, alpha=0.3, linestyle="--", marker=marker)
 
 # Plot the action proportions over time
 # plt.figure(figsize=(12, 8), dpi=150)
