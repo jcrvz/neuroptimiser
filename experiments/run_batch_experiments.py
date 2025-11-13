@@ -33,7 +33,6 @@ DIMENSIONS = [2, 10]
 
 # Parallel execution settings
 MAX_WORKERS = min(cpu_count() - 1, 8)  # Leave 1 CPU free, max 8 workers
-TIMEOUT_PER_EXPERIMENT = 300  # 5 minutes timeout
 
 SCRIPT_PATH = Path(__file__).parent / "nengo-neuropti-v7-batch.py"
 RESULTS_DIR = Path(__file__).parent / "batch_results"
@@ -45,7 +44,7 @@ progress_state = {
     'completed': 0,
     'skipped': 0,
     'failed': 0,
-    'total': 0
+    'total': 1  # Initialize to 1 to avoid division by zero, will be updated before execution
 }
 
 # ==============================================================================
@@ -77,66 +76,55 @@ def run_single_experiment(args):
             total_done = (progress_state['completed'] +
                          progress_state['failed'] +
                          progress_state['skipped'])
-            total = progress_state['total'] if progress_state['total'] > 0 else 1
-            progress = 100 * total_done / total
+            progress = 100 * total_done / progress_state['total']
             print(f"⚠️  Skipped f{fid:02d}_i{instance:02d}_d{dims:02d} | "
                   f"Progress: {total_done}/{progress_state['total']} ({progress:.1f}%)")
         return ('skipped', fid, instance, dims, None)
 
-    # Run the experiment
+    # Run the experiment (NO TIMEOUT - let it complete naturally)
     try:
         result = subprocess.run(
             [sys.executable, str(SCRIPT_PATH),
              str(fid), str(instance), str(dims), str(output_file)],
             capture_output=True,
-            text=True,
-            timeout=TIMEOUT_PER_EXPERIMENT
+            text=True
         )
 
         if result.returncode == 0:
             # Load result for immediate verification
-            with open(output_file, 'r') as f:
-                data = json.load(f)
+            try:
+                with open(output_file, 'r') as f:
+                    data = json.load(f)
+                error = data['performance']['error']
+            except:
+                error = float('nan')
 
             with progress_lock:
                 progress_state['completed'] += 1
                 total_done = (progress_state['completed'] +
                              progress_state['failed'] +
                              progress_state['skipped'])
-                total = progress_state['total'] if progress_state['total'] > 0 else 1
-                progress = 100 * total_done / total
-                error = data['performance']['error']
+                progress = 100 * total_done / progress_state['total']
                 print(f"✅ f{fid:02d}_i{instance:02d}_d{dims:02d} | "
                       f"Error: {error:.2e} | "
                       f"Progress: {total_done}/{progress_state['total']} ({progress:.1f}%)")
 
-            return ('success', fid, instance, dims, data)
+            return ('success', fid, instance, dims, data if 'data' in locals() else None)
         else:
             with progress_lock:
                 progress_state['failed'] += 1
                 total_done = (progress_state['completed'] +
                              progress_state['failed'] +
                              progress_state['skipped'])
-                total = progress_state['total'] if progress_state['total'] > 0 else 1
-                progress = 100 * total_done / total
+                progress = 100 * total_done / progress_state['total']
                 print(f"❌ Failed f{fid:02d}_i{instance:02d}_d{dims:02d} | "
                       f"RC: {result.returncode} | "
                       f"Progress: {total_done}/{progress_state['total']} ({progress:.1f}%)")
+                # Print first 200 chars of stderr if available
+                if result.stderr:
+                    print(f"   Error: {result.stderr[:200]}")
 
             return ('failed', fid, instance, dims, None)
-
-    except subprocess.TimeoutExpired:
-        with progress_lock:
-            progress_state['failed'] += 1
-            total_done = (progress_state['completed'] +
-                         progress_state['failed'] +
-                         progress_state['skipped'])
-            total = progress_state['total'] if progress_state['total'] > 0 else 1
-            progress = 100 * total_done / total
-            print(f"⏱️  Timeout f{fid:02d}_i{instance:02d}_d{dims:02d} | "
-                  f"Progress: {total_done}/{progress_state['total']} ({progress:.1f}%)")
-
-        return ('timeout', fid, instance, dims, None)
 
     except Exception as e:
         with progress_lock:
@@ -144,10 +132,9 @@ def run_single_experiment(args):
             total_done = (progress_state['completed'] +
                          progress_state['failed'] +
                          progress_state['skipped'])
-            total = progress_state['total'] if progress_state['total'] > 0 else 1
-            progress = 100 * total_done / total
+            progress = 100 * total_done / progress_state['total']
             print(f"❌ Error f{fid:02d}_i{instance:02d}_d{dims:02d} | "
-                  f"{str(e)[:50]} | "
+                  f"{str(e)[:100]} | "
                   f"Progress: {total_done}/{progress_state['total']} ({progress:.1f}%)")
 
         return ('error', fid, instance, dims, None)
@@ -322,6 +309,8 @@ def main():
     ]
 
     total_experiments = len(experiments)
+
+    # SET TOTAL BEFORE ANY PARALLEL EXECUTION STARTS
     progress_state['total'] = total_experiments
 
     print(f"\nConfiguration:")
@@ -330,7 +319,7 @@ def main():
     print(f"  Dimensions: {DIMENSIONS}")
     print(f"  Total experiments: {total_experiments}")
     print(f"  Parallel workers: {MAX_WORKERS}")
-    print(f"  Timeout per experiment: {TIMEOUT_PER_EXPERIMENT}s")
+    print(f"  Timeout: None (experiments run to completion)")
 
     # Check if batch script exists
     if not SCRIPT_PATH.exists():
