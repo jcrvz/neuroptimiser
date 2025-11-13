@@ -107,9 +107,9 @@ from neuroptimiser.utils import trs2o
 # PROBLEM CONFIGURATION
 # ==============================================================================
 
-PROBLEM_ID = 20
+PROBLEM_ID = 20  # 1, 10, 15, 20
 PROBLEM_INS = 1
-NUM_DIMS = 2
+NUM_DIMS = 10
 SIMULATION_TIME = 20.0
 
 problem = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMS)

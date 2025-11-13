@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Batch Experiment Runner for Neuromorphic Optimizer v7
-======================================================
+Parallel Batch Experiment Runner for Neuromorphic Optimizer v7
+================================================================
 
-Runs nengo-neuropti-v7 across multiple problem configurations:
+Runs nengo-neuropti-v7 in parallel across multiple problem configurations:
 - Function IDs: 1, 2, 8, 10, 15, 17, 20, 21, 24
 - Instances: 1-15
 - Dimensions: 2, 10
@@ -19,6 +19,9 @@ from datetime import datetime
 from pathlib import Path
 import pandas as pd
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
+import threading
 
 # ==============================================================================
 # CONFIGURATION
@@ -26,11 +29,24 @@ import numpy as np
 
 FUNCTION_IDS = [1, 2, 8, 10, 15, 17, 20, 21, 24]
 INSTANCES = list(range(1, 16))  # 1 to 15
-DIMENSIONS = [2, 5, 10]
+DIMENSIONS = [2, 10]
+
+# Parallel execution settings
+MAX_WORKERS = min(cpu_count() - 1, 8)  # Leave 1 CPU free, max 8 workers
+TIMEOUT_PER_EXPERIMENT = 300  # 5 minutes timeout
 
 SCRIPT_PATH = Path(__file__).parent / "nengo-neuropti-v7-batch.py"
 RESULTS_DIR = Path(__file__).parent / "batch_results"
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Thread-safe progress tracking
+progress_lock = threading.Lock()
+progress_state = {
+    'completed': 0,
+    'skipped': 0,
+    'failed': 0,
+    'total': 0
+}
 
 # ==============================================================================
 # SETUP
@@ -42,20 +58,30 @@ def setup_directories():
     print(f"Results will be saved to: {RESULTS_DIR}")
     return RESULTS_DIR
 
-def run_single_experiment(fid, instance, dims, results_dir):
-    """Run a single experiment configuration"""
+def run_single_experiment(args):
+    """
+    Run a single experiment configuration.
 
-    print(f"\n{'='*70}")
-    print(f"Running: FID={fid}, Instance={instance}, Dims={dims}")
-    print(f"{'='*70}")
+    Args is a tuple: (fid, instance, dims, results_dir)
+    This wrapper allows using map() with multiple arguments.
+    """
+    fid, instance, dims, results_dir = args
 
     # Construct output filename
     output_file = results_dir / f"result_f{fid:02d}_i{instance:02d}_d{dims:02d}.json"
 
     # Skip if already exists
     if output_file.exists():
-        print(f"⚠️  Result already exists, skipping: {output_file.name}")
-        return None
+        with progress_lock:
+            progress_state['skipped'] += 1
+            total_done = (progress_state['completed'] +
+                         progress_state['failed'] +
+                         progress_state['skipped'])
+            total = progress_state['total'] if progress_state['total'] > 0 else 1
+            progress = 100 * total_done / total
+            print(f"⚠️  Skipped f{fid:02d}_i{instance:02d}_d{dims:02d} | "
+                  f"Progress: {total_done}/{progress_state['total']} ({progress:.1f}%)")
+        return ('skipped', fid, instance, dims, None)
 
     # Run the experiment
     try:
@@ -64,27 +90,67 @@ def run_single_experiment(fid, instance, dims, results_dir):
              str(fid), str(instance), str(dims), str(output_file)],
             capture_output=True,
             text=True,
-            timeout=300  # 5 minutes timeout per experiment
+            timeout=TIMEOUT_PER_EXPERIMENT
         )
 
         if result.returncode == 0:
-            print(f"✅ Success: {output_file.name}")
-
-            # Load and return the result for immediate summary
+            # Load result for immediate verification
             with open(output_file, 'r') as f:
                 data = json.load(f)
-            return data
+
+            with progress_lock:
+                progress_state['completed'] += 1
+                total_done = (progress_state['completed'] +
+                             progress_state['failed'] +
+                             progress_state['skipped'])
+                total = progress_state['total'] if progress_state['total'] > 0 else 1
+                progress = 100 * total_done / total
+                error = data['performance']['error']
+                print(f"✅ f{fid:02d}_i{instance:02d}_d{dims:02d} | "
+                      f"Error: {error:.2e} | "
+                      f"Progress: {total_done}/{progress_state['total']} ({progress:.1f}%)")
+
+            return ('success', fid, instance, dims, data)
         else:
-            print(f"❌ Failed with return code {result.returncode}")
-            print(f"STDERR: {result.stderr}")
-            return None
+            with progress_lock:
+                progress_state['failed'] += 1
+                total_done = (progress_state['completed'] +
+                             progress_state['failed'] +
+                             progress_state['skipped'])
+                total = progress_state['total'] if progress_state['total'] > 0 else 1
+                progress = 100 * total_done / total
+                print(f"❌ Failed f{fid:02d}_i{instance:02d}_d{dims:02d} | "
+                      f"RC: {result.returncode} | "
+                      f"Progress: {total_done}/{progress_state['total']} ({progress:.1f}%)")
+
+            return ('failed', fid, instance, dims, None)
 
     except subprocess.TimeoutExpired:
-        print(f"⏱️  Timeout expired for this experiment")
-        return None
+        with progress_lock:
+            progress_state['failed'] += 1
+            total_done = (progress_state['completed'] +
+                         progress_state['failed'] +
+                         progress_state['skipped'])
+            total = progress_state['total'] if progress_state['total'] > 0 else 1
+            progress = 100 * total_done / total
+            print(f"⏱️  Timeout f{fid:02d}_i{instance:02d}_d{dims:02d} | "
+                  f"Progress: {total_done}/{progress_state['total']} ({progress:.1f}%)")
+
+        return ('timeout', fid, instance, dims, None)
+
     except Exception as e:
-        print(f"❌ Error: {e}")
-        return None
+        with progress_lock:
+            progress_state['failed'] += 1
+            total_done = (progress_state['completed'] +
+                         progress_state['failed'] +
+                         progress_state['skipped'])
+            total = progress_state['total'] if progress_state['total'] > 0 else 1
+            progress = 100 * total_done / total
+            print(f"❌ Error f{fid:02d}_i{instance:02d}_d{dims:02d} | "
+                  f"{str(e)[:50]} | "
+                  f"Progress: {total_done}/{progress_state['total']} ({progress:.1f}%)")
+
+        return ('error', fid, instance, dims, None)
 
 def load_all_results(results_dir):
     """Load all JSON results from the results directory"""
@@ -238,53 +304,59 @@ def save_summary(df, results_dir, timestamp):
 # ==============================================================================
 
 def main():
-    """Run all experiments"""
+    """Run all experiments in parallel"""
 
     print("="*70)
-    print("BATCH EXPERIMENT RUNNER - Neuromorphic Optimizer v7")
+    print("PARALLEL BATCH EXPERIMENT RUNNER - Neuromorphic Optimizer v7")
     print("="*70)
 
     # Setup
     results_dir = setup_directories()
 
-    # Calculate total experiments
-    total_experiments = len(FUNCTION_IDS) * len(INSTANCES) * len(DIMENSIONS)
+    # Generate all experiment configurations
+    experiments = [
+        (fid, instance, dims, results_dir)
+        for fid in FUNCTION_IDS
+        for dims in DIMENSIONS
+        for instance in INSTANCES
+    ]
+
+    total_experiments = len(experiments)
+    progress_state['total'] = total_experiments
+
     print(f"\nConfiguration:")
     print(f"  Function IDs: {FUNCTION_IDS}")
     print(f"  Instances: {min(INSTANCES)}-{max(INSTANCES)}")
     print(f"  Dimensions: {DIMENSIONS}")
     print(f"  Total experiments: {total_experiments}")
+    print(f"  Parallel workers: {MAX_WORKERS}")
+    print(f"  Timeout per experiment: {TIMEOUT_PER_EXPERIMENT}s")
 
     # Check if batch script exists
     if not SCRIPT_PATH.exists():
         print(f"\n❌ Error: Batch script not found: {SCRIPT_PATH}")
-        print("Creating it now...")
-        create_batch_script()
+        print("Please create nengo-neuropti-v7-batch.py first!")
+        return
 
-    # Run all experiments
-    completed = 0
-    failed = 0
-    skipped = 0
+    print(f"\n{'='*70}")
+    print("STARTING PARALLEL EXECUTION")
+    print(f"{'='*70}\n")
 
     start_time = datetime.now()
 
-    for fid in FUNCTION_IDS:
-        for dims in DIMENSIONS:
-            for instance in INSTANCES:
-                result = run_single_experiment(fid, instance, dims, results_dir)
+    # Run experiments in parallel
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all jobs
+        futures = {executor.submit(run_single_experiment, exp): exp
+                  for exp in experiments}
 
-                if result is not None:
-                    completed += 1
-                elif (results_dir / f"result_f{fid:02d}_i{instance:02d}_d{dims:02d}.json").exists():
-                    skipped += 1
-                else:
-                    failed += 1
-
-                # Print progress
-                total_done = completed + failed + skipped
-                progress = 100 * total_done / total_experiments
-                print(f"Progress: {total_done}/{total_experiments} ({progress:.1f}%) - "
-                      f"✅ {completed} | ⚠️ {skipped} | ❌ {failed}")
+        # Process results as they complete
+        for future in as_completed(futures):
+            try:
+                status, fid, instance, dims, data = future.result()
+            except Exception as e:
+                exp = futures[future]
+                print(f"❌ Exception for {exp}: {e}")
 
     end_time = datetime.now()
     duration = end_time - start_time
@@ -293,10 +365,14 @@ def main():
     print("BATCH COMPLETION SUMMARY")
     print("="*70)
     print(f"Total experiments: {total_experiments}")
-    print(f"Completed: {completed}")
-    print(f"Skipped (already done): {skipped}")
-    print(f"Failed: {failed}")
+    print(f"Completed: {progress_state['completed']}")
+    print(f"Skipped (already done): {progress_state['skipped']}")
+    print(f"Failed: {progress_state['failed']}")
     print(f"Duration: {duration}")
+
+    if progress_state['completed'] > 0:
+        avg_time = duration.total_seconds() / progress_state['completed']
+        print(f"Average time per completed experiment: {avg_time:.1f}s")
 
     # Load all results and create summary
     print("\nLoading all results...")
@@ -309,13 +385,10 @@ def main():
     else:
         print("No results found to summarize")
 
-    print("\n✅ Batch experiments complete!")
+    print("\n✅ Parallel batch experiments complete!")
+    print(f"   Used {MAX_WORKERS} parallel workers")
+    print(f"   Speedup: ~{MAX_WORKERS}x faster than sequential execution")
 
-def create_batch_script():
-    """Create the batch-compatible version of the main script"""
-    # This will be called if the batch script doesn't exist
-    # We'll read the original and modify it
-    pass
 
 if __name__ == "__main__":
     main()

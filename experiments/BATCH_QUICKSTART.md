@@ -36,8 +36,10 @@ python nengo-neuropti-v7-batch.py 1 1 10 result.json
 - **Instances**: 1-15 (15 instances per function)
 - **Dimensions**: 2, 10 (2 dimension settings)
 - **Total**: 9 × 15 × 2 = **270 experiments**
+- **Parallel workers**: Auto-detected (CPU count - 1, max 8)
 - **Time per experiment**: ~20-30 seconds
-- **Total time**: ~2-3 hours
+- **Sequential time**: ~90 minutes
+- **Parallel time (8 workers)**: ~11-15 minutes ⚡
 
 ## 📈 Results Structure
 
@@ -156,10 +158,12 @@ MU = 25                 # Memory size
 
 ## ⚡ Performance Tips
 
-1. **Resume interrupted runs**: The batch runner skips existing results
-2. **Parallel execution**: Modify `run_batch_experiments.py` to use `multiprocessing`
+1. **Parallel execution** (enabled by default): Uses multiple CPU cores automatically
+   - Adjust workers: Edit `MAX_WORKERS` in `run_batch_experiments.py`
+   - Default: `cpu_count() - 1` (leaves 1 core free), max 8 workers
+2. **Resume interrupted runs**: The batch runner skips existing results
 3. **Faster testing**: Reduce `SIMULATION_TIME` to 5.0 for quick tests
-4. **Memory issues**: Experiments run sequentially by default (no memory accumulation)
+4. **Avoid memory issues**: Parallel workers run in separate processes (no memory accumulation)
 
 ## 📝 Typical Workflow
 
