@@ -1,0 +1,409 @@
+% This is samplepaper.tex, a sample chapter demonstrating the
+% LLNCS macro package for Springer Computer Science proceedings;
+% Version 2.21 of 2022/01/12
+%
+\documentclass[orivec, runningheads]{llncs}
+
+\input{macros}
+\hyphenation{%
+    a-syn-chro-nous %ey-sing-kruh-nuhs
+}
+
+\begin{document}
+%
+\title{A Roadmap for Evolutionary Algorithms on Neuromorphic Hardware}
+%
+%\titlerunning{Abbreviated paper title}
+% If the paper title is too long for the running head, you can set
+% an abbreviated paper title here
+%
+\author{%
+Jorge M.~Cruz-Duarte\orcidID{0000-0003-4494-7864} \and
+El-Ghazali~Talbi\orcidID{0000-0003-4549-1010}}
+%
+\authorrunning{J. M. Cruz-Duarte and E-G. Talbi}
+% First names are abbreviated in the running head.
+% If there are more than two authors, 'et al.' is used.
+%
+\institute{%
+    University of Lille, CNRS, Inria, Centrale Lille,\\
+    UMR 9189 CRIStAL, F-59000 Lille, France.\\
+    Emails: \email{\{jorge.cruz-duarte, el-ghazali.talbi\}@univ-lille.fr}
+}
+%
+\maketitle              % typeset the header of the contribution
+%
+\begin{abstract}
+%%%
+
+\keywords{
+Neuromorphic Optimisation \and Spiking Neural Networks \and Heuristics \and Asynchronous Search \and Izhikevich \and Differential Evolution
+}
+\end{abstract}
+%
+%
+%
+\section{Introduction}
+
+introduce de, pso, sp, lv
+
+% AI's energy crisis. Why is current hardware limiting?
+
+% What has been done in the literature to solve this?
+
+% Neuromorphic computing's rise: Loihi, TrueNorth, SpiNNaker
+
+
+% Our thesis: Neuromorphic hardware could revolutionise EC
+
+
+
+
+\section{Current State} %
+
+% Existing work on neuroevolution, look at Stanley and Floreano
+
+% Talk about Neuroptimiser
+
+% Spiking neural networks for optimisation (brief survey)
+
+\section{Proposed Approach\label{sec:prop}}
+
+The proposed approach is founded on two main pillars. First, the algorithmic theory of adaptive Metaheuristic (MH) control, and second, the neuromorphic embodiment via action selection based on the Cortico-Basal-Thalamic Loop (CBTL).
+
+\subsection{Algorithmic Architecture}
+
+From the algorithmic point of view, the backbone of the approach is built upon the generalised MH model proposed in \cite{Cruz-Duarte2020}. We also use the definition of heuristic as a strategy that generates or modifies one or more candidate solutions to address a specific problem \cite{Drake2020, talbi2009metaheuristics}. Thus, an MH can be defined as a composition of several Simple Heuristics. In this context, SHs and MHs are low- and high-level heuristics indicating their degree of directness to interaction with the problem domain; \ie low-level ones directly manipulate candidate solutions whilst high-level ones do so by, for example, selecting a low-level heuristic.
+%
+(We avoid using the term Hyper-Heuristic to avoid misunderstandings, as it has subtle overlapping definitions with MHs worth discussing with colleagues and beers; for further reading, refer to \cite{Drake2020, hassan2021dynamic}.)
+
+Without loss of generality, we use a two-domain level representation in this work \cite{hassan2021dynamic}.
+On the one hand, the low-level corresponds to the continuous minimisation problem \((\mathfrak{X},f)\), where \(\mathfrak{X}\subseteq\mathbb{R}^D\) stands for the feasible \(D\)-dimensional domain, and \(f:\pmb{x}\in\mathfrak{X}\mapsto\mathbb{R}\) represents the cost function.
+Therefore, the objective is to find the optimal design vector \(\pmb{x}_*\in\mathfrak{X}\) that minimises \(f\), \ie $f(\pmb{x}_*)\leq f(\pmb{x}),\;\forall\,\pmb{x}\in\mathfrak{X}$, such as,
+\begin{equation} \label{Eq:MinimisationProblem}
+        \pmb{x}_* = \underset{\pmb{x}\in\mathfrak{X}}{\arg\!\min}\left\{ f(\pmb{x})\right\}.
+\end{equation}
+Moreover, when implementing evolutionary or iterative processes for tackling this problem, we consider one or more (a population) candidate solutions given by \(\pmb{X}^k=\{\pmb{x}_i^k\}_{i=1}^{N},\,\forall\,\pmb{x}_i^k\in\mathfrak{X}\), where \(N\) is the population size at the step \(k\).
+
+On the other hand, the high-level domain governs the composition and coordination of SHs that define the MH search process, where \(\mathfrak{H}\subseteq\mathbb{H}\) corresponds to the SH collection from all possible heuristics.
+%
+SHs are classified as either generative \(h_g\in\mathfrak{H}\) or selective \(h_s\in\mathfrak{H}\), corresponding to how they yield candidate solutions \cite{Drake2020}.
+Recall that generation SH may also be referred to as perturbation; however, the former definition encompasses the latter, as generation may consider the current search state.
+Thus, applying an \(h_s\) after \(h_g\) describes a basic search step, which can be defined as a Search Operator (SO), such as \(h_o\triangleq h_s \circ h_g,\,\forall\ h_o\in \mathfrak{H}_o\subset\mathfrak{H}\) \cite{Cruz-Duarte2020}.
+For example, a local random walk followed by a Metropolis criterion stands for the core SO from Simulated Annealing (SA).
+%
+Therefore, the high-level problem focuses on determining, at each iteration \(k\), which SO or composition of SOs should be applied to the current population \(\pmb{X}^k\) to improve the optimisation performance. Formally, this can be defined using the MH composition problem in \cite{Cruz-Duarte2021a}, such as
+\begin{equation}
+\label{Eq:HighLevelProblem}
+    h_{*}^k = \underset{h_o \in \mathfrak{H}_o\subset\mathfrak{H}}{\arg\!\max}\; U\!\left(h_o,\, \pmb{s}^k\right),
+\end{equation}
+where \(U(h_o,\,\pmb{s}^k)\) denotes the utility or expected performance of SO \(h_o\) under the current search state \(\pmb{s}^k\), which encodes relevant information such as population diversity, improvement rate, and convergence \cite{eiben2004introduction, doerr2019theory}.
+The selected operator \(h_*^k\) is then applied to \(\pmb{X}^k\) get \(\pmb{X}^{k+1}\), \ie
+\(%\begin{equation}
+%\label{Eq:ActionApply}
+    \pmb{X}^{k+1}\gets h_{*}^k\{\pmb{X}^k\}
+\).%\end{equation}
+
+It is noteworthy that \eqref{Eq:HighLevelProblem} represents a generalised implementation for MHs with more than one SO, such as hybrid MHs or a portfolio of MHs \cite{velasco2024literature}. For most of the MHs in the literature, the feasible SO collection \(\mathfrak{H}_o\) has up to two elements, an SO and a unit-element \(h_e\), \ie \(h_e\{\pmb{X}^k \}=\pmb{X}^k \) \cite{Cruz-Duarte2020}. Hence,
+\begin{equation}
+\label{Eq:TradMHFinaliser}
+    h^k \triangleq
+    \begin{cases}
+        h_o, & \text{if } U(h_o, \pmb{s}^k) \geq 0, \\
+        h_e, & \text{otherwise},
+    \end{cases}
+\end{equation}
+since \(U\) still denotes the utility, indicating that \(h_o\) is applied whenever an expectation of improvement exists; otherwise, the process finalises.
+
+The above-mentioned formulation in \eqref{Eq:HighLevelProblem} naturally establishes an analogy with RL, where the SO selection corresponds to the choice of an action, the search state \(\pmb{s}^k\) acts as the environment state, and the observed improvement in the objective function provides a reward signal. The utility function \(U(h_o,\pmb{s}^k)\) thus plays the role of a value function estimating the expected return of applying \(h_o\) under the current search conditions. Consequently, the high-level problem can be interpreted as a sequential decision process in which the MH learns, through reward-based adaptation, to prioritise operators that yield higher long-term improvement in the optimisation landscape.
+
+% brme-mofk-xupb-cuyk
+
+% Basal ganglia architecture
+\subsection{Cortico-Basal-Thalamic Loop Architecture}
+
+Now, we proceed to describe the second pillar of our approach. Although RL was previously introduced in the algorithmic context, the Cortico-Basal-Thalamic Loop (CBTL) architecture embeds it intrinsically within its neural decision-making process, where the reward-based adaptation emerges from biologically inspired competition and inhibition mechanisms.
+%Thus, the state of the search process is encoded by a three-dimensional ensemble representing diversity, improvement rate, and convergence. Each dimension is projected toward operator-specific utility ensembles, which are evaluated by a basal ganglia network implementing winner-take-all competition and thalamic gating for one-hot selection.
+\figurename~\ref{Fi:MainArch} illustrates the overall neuromorphic operator-selection process. In this architecture \cite{gurney2001computational,chakravarthy2010basal}, the Sensory Cortex encodes the search state \(\pmb{s}(t)\), the Striatum computes operator utilities \(\pmb{u}_o(t)\), and the Globus Pallidus performs Winner-Take-All (WTA) competition to disinhibit the corresponding thalamic channel. Together, these two structures constitute the functional core of the Basal Ganglia, which mediates the selection of the most salient action under the current search state. The Thalamus then gates a one-hot action vector \(\pmb{a}(t)\) \cite{Eliasmith2011nengo, Sharma2016largeNengo}, which activates the Motor Cortex to generate new candidate solutions \(\pmb{X}(t)\), which are evaluated by the objective function \(\pmb{f}(t)\). The resulting fitness feedback \(r(t)\) that updates both the memory and the operator utilities, thereby closing the CBTL-driven optimisation loop.
+
+\begin{figure}[!htp]
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/Main.png}
+    \caption{Neuromorphic operator-selection process implemented through a Cortico-Basal-Thalamic Loop (CBTL). The Sensory Cortex encodes the search state \(\pmb{s}(t)\), the Striatum computes operator utilities \(\pmb{u}_o(t)\), and the Globus Pallidus performs Winner-Take-All (WTA) competition for disinhibiting the selected thalamic channel. Then, the Thalamus gates a one-hot action vector \(\pmb{a}(t)\) driving the Motor Cortex to generate new candidate solutions \(\pmb{X}(t)\) and evaluate on \(\pmb{f}(t)\). This fitness feedback updates the memory and operator utilities, closing the CBTL-driven optimisation cycle.}
+    \label{Fi:MainArch}
+\end{figure}
+
+Notice that we use \(\pmb{X}(t)\) instead of \(\pmb{X}^k\) from the algorithmic formulation. This reflects the continuous-time nature of the neuromorphic process, in which the population state evolves as a function of simulation time \(t\). However, both representations can be related through the evaluation interval \(\Delta t_{\mathrm{eval}}\), such that \(t = k\,\Delta t_{\mathrm{eval}}\), where each discrete evaluation step \(k\) corresponds to an observation or update period within the continuous neural simulation. The global simulation time advances in smaller integration steps \(\Delta t\), satisfying \(\Delta t \leq \Delta t_{\text{eval}}\).
+
+Formally, the CBTL mechanism can be represented as a closed control loop
+\begin{equation}\label{Eq:ClosedLoop}
+    \pmb{s}(t) \rightarrow \pmb{u}_o(t) \rightarrow \pmb{a}(t) \rightarrow \pmb{X}(t) \rightarrow r(t).
+\end{equation}
+Each of these quantities evolves continuously over time under neural ensemble dynamics, whereas operator evaluation occurs at discrete intervals, as mentioned above. This closed-loop formulation highlights the correspondence between the algorithmic and neural representations, where continuous neural activity modulates operator selection through recurrent feedback. It establishes the dynamic basis for the mechanisms detailed in the following sections, which provide a detailed description of each component of this loop, including the state representation, utility computation, basal-ganglia competition, and the learning rule that governs the adaptation of utilities.
+
+\subsection{State Representation}
+
+The search state at time \(t\) is defined as \(\pmb{s}(t) = (\phi_d,\phi_i,\phi_c)^\intercal \in [0,1]^3\), where \(\phi_d\), \(\phi_i\), and \(\phi_c\) denote diversity, improvement rate, and convergence. We consider these three descriptors to comprise the minimal but sufficient representation of the search condition, characterising the exploration-exploitation balance, conveyed to the neural state ensemble within the CBTL architecture.
+
+First of all, the population is internally represented in the normalised domain \(\mathfrak{V} = [-1,1]^D\), which is affinely mapped to the feasible \(D\)-dimensional parallelepiped domain \(\mathfrak{X} = \prod_{j=1}^D [x_{l,j}, x_{u,j}] \subset \mathbb{R}^D\) through the transformation
+\begin{equation}\label{Eq:AffineTrans}
+    \mathcal{T}\{\pmb{v}\} = \frac{1}{2} (\pmb{x}_u - \pmb{x}_l)\odot \pmb{v} + \frac{1}{2}(\pmb{x}_u + \pmb{x}_l),
+\end{equation}
+where \(\pmb{x}_l\) and \(\pmb{x}_u\) denote the lower and upper bounds of the search space, and \(\odot\) represents the Hadamard-Schur product. Hence, each stored vector \(\pmb{v}_i^k \in \ \mathfrak{V}\) corresponds to a candidate solution \(\pmb{x}^k_i = \mathcal{T}(\pmb{v}^k_i) \in \mathfrak{X}\), evaluated as \(f^{k}_i = f(\pmb{x}^{k}_i)\).
+%
+At each evaluation step \(k\), the valid memory \(\pmb{V}^k = \{\pmb{v}_i^k\}_{i=1}^{N}\) contains the current set of encoded solutions, and the corresponding fitness vector \(\pmb{f}^k = \{f_i^k\}_{i=1}^{N}\) stores their evaluations. (Recall that \(\pmb{X}^k\) and \(\pmb{V}^k\) can be equivalently represented as \(N\times D\) matrices.) Plus, the best-so-far fitness is denoted by \(f_\star^k = \min_i f_i^k\), attained at the corresponding vector \(\pmb{v}_\star^k\).
+
+Therefore, the diversity feature \(\phi_d^k\) quantifies the population dispersion as the average marginal standard deviation of the normalised vectors in \(\pmb{V}^k\). This feature is assessed as
+\begin{equation}\label{Eq:FeatDiversity}
+    \phi_d^k = \frac{\sqrt{3}}{D}\sum_{j=1}^{D}\operatorname{Std}\{\pmb{v}_{\cdot,j}^k\},
+\end{equation}
+since \(\pmb{v}_{\cdot, j}^k = (v_{1,j}^k, \dots, v_{N,j}^k)^\intercal\) denotes the \(j\)\textsuperscript{th} column of \(\pmb{V}^k\), and the factor \(\sqrt{3}\) arises from \(\sigma_{\max} = \operatorname{Std}\{\mathcal{U}(-1,1)\}\) as the theoretical upper bound for the standard deviation attainable within the normalised domain \([-1,1]\).
+%Consequently, this descriptor lies within the unit interval \([0,1]\).
+
+The improvement-rate feature \(\phi_i^k\) quantifies the proportion of recent evaluations that have produced a better best-so-far fitness value \(f_\star^{k} \) over a sliding window of length \(W\). It is defined using  the indicator function \(\mathbb{I}\{\cdot\}\) as follows,
+\begin{equation}\label{Eq:FeatImprovement}
+    \phi_i^k = \frac{1}{W}\sum_{q=k-W+1}^{k}\mathbb{I}\left\{\,f_\star^{q} < f_\star^{q-1}\right\}.
+\end{equation}
+
+Lastly, the convergence feature \(\phi_c^k\) captures the degree of fitness homogeneity within the current population. It is expressed as
+\begin{equation}\label{Eq:FeatConvergence}
+    \phi_c^k =
+    \frac{1}{1 + \lambda_c\,\rho_c^k},
+    \qquad
+    \rho_c^k =
+    \frac{\Delta f^k}{\,|f_\star^{k}| + \eta_c\,\Delta f^k + \epsilon\,},
+\end{equation}
+where \(\Delta f^k = \max(\pmb{f}^k) - \min(\pmb{f}^k)\).
+The scaling coefficient \(\lambda_c \,(=10)\) controls the sensitivity of \(\phi_c^k\). The regularisation factor \(\eta_c \,(=10^{-2})\) smoothly balances between relative and absolute scaling when \(|f_\star^{(k)}|\) approaches zero. Plus, \(\epsilon\,(=10^{-12})\) corresponds to a numerical stabiliser to prevent division singularities.
+% This continuous formulation preserves boundedness within the unit interval \([0,1]\) and eliminates discontinuities arising from near-zero denominators.
+
+\subsection{Operator Diversity}\label{Sec:OpDiversity}
+
+Four complementary SOs are implemented to capture distinct search dynamics within the normalised feasible domain \(\mathfrak{V}=[-1,1]^D\). These correspond to L\'evy Flight (LF) for stochastic global exploration \cite{Li2022Levy}, Differential Mutation (DM) for memory-guided recombination \cite{Storn1997Differential}, Particle Swarm (PS) for velocity-driven exploitation \cite{Kennedy1995particle}, and Spiral (SP) for logarithmic refinement near the current best candidate \cite{omar2022recent}.
+Each operator \(h_o\in\mathfrak{H}=\{h_\text{LF},h_\text{DM},h_\text{PS},h_\text{SP}\}\) generates \(N\) candidate solutions around the centroid \(\pmb{v}_\odot^k\in\mathfrak{V}\), which represents the current fitness-weighted centre of the memory \(\pmb{V}^k\in\mathfrak{V}\). The resulting populations \(\pmb{V}^{k+1}=\{\pmb{v}_i^k\}_{i=1}^N\) are evaluated in parallel, preserving the distributed computational nature of the neuromorphic process.
+
+The LF operator samples heavy-tailed perturbations following Man\-tegna-Stanley's formulation with exponent \(\beta=1.5\) \cite{mantegna1994stochastic},
+\begin{equation} \label{Eq:LevyFlight}
+	    \pmb{v}_i^{k+1}\gets\pmb{v}_\odot^k + \alpha_1 \pmb{\ell}_i + \alpha_2 (\pmb{v}_\star^k - \pmb{v}_\odot^k),
+\end{equation}
+where \(\alpha_1,\alpha_2\in\mathbb{R}^+\) are scaling factors controlling the stochastic and directional components, respectively. We use \(\alpha_1=0.3\) and \(\alpha_2=0.1\) in this work.
+The i.i.d. random perturbation vector \(\pmb{\ell}_i\) using the symmetric L\'evy stable distribution is generated as
+\begin{equation} \label{Eq:LevyStable}
+    \pmb{\ell}_i\ni\ell_{i,j}=\frac{\varrho_{i,j}}{|\rho_{i,j}|^{1/\beta}},
+    \quad
+    \varrho_{i,j}\sim\mathcal{N}(0,\sigma_\varrho^2),
+    \quad
+    \rho_{i,j}\sim\mathcal{N}(0,1),
+\end{equation}
+and
+\begin{equation}
+    \sigma_\varrho=\!\left(\frac{\Gamma(1+\beta)\sin(\pi\beta/2)}{\Gamma((1+\beta)/2)\,\beta\,2^{(\beta-1)/2}}\right)^{1/\beta}.
+\end{equation}
+This operation yields occasional long jumps interspersed with short exploratory moves, enabling global exploration across the normalised domain \(\mathfrak{V}\).
+
+For the DM operator, we adopt the canonical DE/rand/1 mutation strategy~\cite{Storn1997Differential}, where three distinct memory items \(r_1,r_2,r_3\in\{1,\dots,N\}\) are randomly sampled to construct a mutant vector,
+\begin{equation} \label{Eq:DiffMutation}
+    \pmb{v}^{k+1}_i\gets\pmb{v}_{r_1}^{k}+F\big(\pmb{v}_{r_2}^{k}-\pmb{v}_{r_3}^{k}\big),
+\end{equation}
+since \(F\,(=0.8)\) is the differential weight controlling the amplification of the directional component. This formulation holds population diversity by exploiting pairwise differences in the memory; this provides self-scaling variation without explicit parameter tuning. For simplicity, we disregard the crossover operation that follows the mutation in DE.
+
+The PS operator from PSO maintains a velocity \(\pmb{u}_i^k\) and position \(\pmb{v}_i^k\) for each particle \(i\), initialised near the centroid \(\pmb{v}_\odot^k\) \cite{Kennedy1995particle}. The velocity update rule follows
+\begin{equation}\label{Eq:ParticleSwarmVel}
+    \pmb{u}_i^{k+1} \gets
+    \omega\,\pmb{u}_i^k
+    + c_1 r_1(\pmb{v}_\odot^k-\pmb{v}_i^k)
+    + c_2 r_2(\pmb{v}_\star^k-\pmb{v}_i^k),
+\end{equation}
+where \(\omega\,(=0.7)\) is the inertial weight, \(c_1,c_2\,(=1.5)\) are the cognitive and social coefficients, and \(r_1,r_2\sim\mathcal{U}(0,1)\) are uniformly i.i.d. random scalars. The particle position is then updated as
+\begin{equation}\label{Eq:ParticleSwarmPos}
+    \pmb{v}_i^{k+1} \gets \pmb{v}_i^k+\pmb{u}_i^{k+1}.
+\end{equation}
+Consider that velocity magnitudes are constrained by \(\|\pmb{u}_i^k\|_\infty\le0.5\) to preserve numerical stability and maintain feasible displacements within \(\mathfrak{V}\).
+Unlike purely stochastic or differential mechanisms, PS introduces a dynamic balance between momentum and attraction towards both \(\pmb{v}_\odot^k\) and \(\pmb{v}_\star^k\), thus promoting collective convergence while retaining controlled variability.
+
+
+Lastly, the SP operator implements an anisotropic variant of the logarithmic spiral mechanism~\cite{Tamura2011spiral}. Unlike the sequential formulation of classical Spiral Dynamics, this implementation generates multiple candidates simultaneously, each following an independent stochastic spiral trajectory around \(\pmb{v}_\star^k\). Each candidate is generated as
+\begin{equation}\label{Eq:SpiralCandidate}
+    \pmb{v}_i^{k+1} \gets
+    \pmb{v}_\star^k +
+    \pmb{r}_{\theta_i} \odot
+    \pmb{R}_{\theta_i}
+    \big(\pmb{v}_\odot^k - \pmb{v}_\star^k\big),
+\end{equation}
+where \(\pmb{r}_{\theta_i}=(r_{i,1}^{\theta_{i,1}},\dots,r_{i,D}^{\theta_{i,D}})^\intercal\in[r_\text{min},1.0[^D\) holds the per-plane contraction factors, with \(r_\text{min}\,(=0.85)\), and \(\pmb{R}_{\theta_i}\) is the block-diagonal rotation composed of \(2\times2\) matrices \(\pmb{R}(\theta_{i,p})\) for angles \(\theta_{i,p}\sim\mathcal{U}(0,2\pi)\), where \(p\) denotes the 2D subspace \((d,d+1)\) corresponding to a plane amongst the \(\lfloor D/2 \rfloor\) orthogonal pairs of coordinate. Each contraction factor \(r_{i,p}\) is also drawn independently from \(\mathcal{U}(r_\text{min},1.0)\), introducing random variability in the radial decay rate and enhancing local anisotropy. For odd-dimensional cases, the remaining coordinate follows the same contraction rule but without rotation.
+
+Each operator encodes a distinct mechanism of variation. L\'evy Flight and Differential Mutation promote exploratory search, whereas Particle Swarm and Spiral Optimisation reinforce exploitative refinement. Their activation arises adaptively from the basal-ganglia selection dynamics rather than being predefined or scheduled. The resulting candidate populations are projected onto the feasible domain \(\mathfrak{V}\), ensuring boundedness within the normalised space and maintaining numerical stability throughout the optimisation process.
+
+\subsection{Learning Rule}\label{Sec:LearningRule}
+
+The adaptation of utilities follows a local reinforcement rule that modulates the weight \(w_{h_o}\) of the last executed heuristic \(h_o\) according to its contribution to the best fitness improvement, which is encoded by the search state \(\pmb{s}(t)=(\phi_d,\phi_i,\phi_c)^\intercal\).
+Therefore, the state-dependent utilities driving the basal-ganglia selection dynamics are expressed as
+\begin{equation}\label{Eq:UtilityVector}
+    \pmb{u}_o(t) = \pmb{W}\,(\pmb{A}\,\pmb{s}(t) + \pmb{b}),
+\end{equation}
+where \(\pmb{W}=\operatorname{diag}(w_{h_\text{LF}},w_{h_\text{DM}},w_{h_\text{PS}},w_{h_\text{SP}})\),
+\(\pmb{A}\in\mathbb{R}^{4\times3}\) and \(\pmb{b}\in\mathbb{R}^4\) are given by
+\begin{equation}
+    \pmb{A} =
+    \begin{pmatrix}
+    0   & -0.5 & -0.3\\
+    0.8 & 0    & -0.3\\
+    0   & 0.8  & 0.4\\
+    0   & 0.4  & 0.8
+    \end{pmatrix},
+    \quad\text{and}\quad
+    \pmb{b} =
+    \begin{pmatrix}
+    0\\
+    0.2\\
+    0.2\\
+    0.1
+    \end{pmatrix}.
+\end{equation}
+
+Keeping this in mind, after each evaluation, the local reinforcement signal \(r(t)\) is computed as
+\begin{equation}\label{Eq:Reward}
+    r(t)=\frac{\max\{0,\,f_\star(t-\!1)-f_\star(t)\}}{|f_\star(t-\!1)|+\epsilon},
+\end{equation}
+recalling that \(f_\star(t)\) corresponds to the best-so-far fitness and \(\epsilon\,(=10^{-12})\) works as a numerical stabiliser.
+Then, the weight of the executed search operator is updated as follows,
+\begin{equation}\label{Eq:WeightUpdate}
+    w_{h_o}(t) \gets
+    \min\!\Big\{
+        w_{\max},
+        \max\!\big\{w_{\min},w_{h_o}(t-\!1) + \eta r(t) - \delta\left(1-\mathbb{I}\{r(t)>0\}\right)\big\}
+    \Big\},
+\end{equation}
+where \(\eta\,(=0.2)\) and \(\delta\,(=0.01)\) define the learning and decay rates, respectively, \(\mathbb{I}\{\cdot\}\) is the indicator function, and \([w_{\min},w_{\max}]\) bounds the admissible range of the adaptive weight \(w_{h_o}\); we choose \(w_{h_o}\in[0.1, 5.0]\).
+This rule increases the weight of successful \(h_o\) proportionally to their improvement contribution, while applying a mild decay otherwise, thus preserving adaptive stability within the CBTL dynamics, \ie behavioural plasticity.
+
+Action selection within the CBTL architecture follows utility-driven basal ganglia dynamics, complemented by an \(\varepsilon\)-greedy stochastic component that maintains exploratory variability \cite{Sutton2018RL}. For this work, we choose \(\varepsilon=0.1\).
+
+\subsection{Spiking Neural Networks}
+
+The CBTL architecture is implemented through a collection of neural ensembles employing the Neural Engineering Framework (NEF) \cite{Eliasmith2003neural}, which provides a systematic method for encoding continuous values into spike trains, transforming representations through synaptic weights, and decoding ensemble activity into control signals. Each ensemble comprises spiking neurons whose collective activity represents a continuous vector through population coding, enabling distributed computation across neuromorphic substrates whilst maintaining numerical precision comparable to conventional floating-point arithmetic.
+
+The \emph{Sensory Cortex} is realised through a three-dimensional ensemble of \(n_{\text{state}} = 300\) spiking neurons encoding the normalised state vector \(\pmb{s}(t) = (\phi_d, \phi_i, \phi_c)^\intercal \in [0,1]^3\). This ensemble employs Leaky Integrate-and-Fire (LIF) neurons with heterogeneous tuning curves, each neuron preferentially responsive to a particular region of the state space. The collective firing pattern across the population provides a distributed representation resilient to individual neuron failures, a characteristic intrinsic to biological neural systems. Formally, the spike train \(\rho_j(t)\) of neuron \(j\) follows
+\begin{equation}
+    \tau_{\text{rc}} \frac{d v_j}{dt} = -v_j + J_j(\pmb{s}),
+    \quad
+    J_j(\pmb{s}) = \alpha_j \langle \pmb{e}_j, \pmb{s} - \pmb{s}_j^{\text{bias}} \rangle + J_j^{\text{bias}},
+\end{equation}
+where \(\tau_{\text{rc}} = 20\,\text{ms}\) denotes the membrane time constant, \(v_j\) represents the membrane potential, \(\pmb{e}_j\in\mathbb{S}^2\) is the neuron's preferred direction (encoder), \(\pmb{s}_j^{\text{bias}}\) encodes its bias point, and \(\alpha_j, J_j^{\text{bias}}\) are gain and bias current parameters randomly drawn to ensure heterogeneous coverage of the representational space. A spike is emitted when \(v_j\) crosses threshold, followed by a refractory period of \(\tau_{\text{ref}} = 2\,\text{ms}\).
+
+The \emph{Striatum} comprises four operator-specific utility ensembles, each instantiated as a one-dimensional ensemble with \(n_{\text{util}} = 100\) LIF neurons and radius \(r_{\text{util}} = 3.0\). These ensembles project the three-dimensional state representation onto scalar utility values \(u_{h_o}(t)\) according to \eqref{Eq:UtilityVector}. The projection is realised through filtered synaptic connections from the Sensory Cortex, where the synaptic weight matrix \(\pmb{W}_{\text{syn}}^{(h_o)} \in \mathbb{R}^{n_{\text{util}} \times n_{\text{state}}}\) implements the affine transformation \(\pmb{A}\pmb{s}(t) + \pmb{b}\) through least-squares optimisation during network construction. Synaptic filtering is governed by an exponential kernel with time constant \(\tau_{\text{syn}} = 10\,\text{ms}\), introducing temporal smoothing that attenuates high-frequency noise whilst preserving the underlying utility signal. Consequently, the decoded utility estimate \(\hat{u}_{h_o}(t)\) approximates the theoretical value with root-mean-square error typically below \(5\%\) under nominal operating conditions.
+
+The \emph{Basal Ganglia} network implements Winner-Take-All (WTA) competition through mutual inhibition across four action channels, each represented by \(n_{\text{BG}} = 100\) neurons. This subsystem follows the architecture proposed in \cite{gurney2001computational}, wherein the Globus Pallidus Interna (GPi) receives excitatory input from utility ensembles and projects inhibitory signals onto the Thalamus. The competitive dynamics arise from lateral inhibition within the GPi, effectively amplifying differences in utility magnitudes. Let \(\pmb{u}_o(t) = (u_{h_{\text{LF}}}, u_{h_{\text{DM}}}, u_{h_{\text{PS}}}, u_{h_{\text{SP}}})^\intercal\) denote the utility vector. The GPi output \(\pmb{g}(t)\) obeys
+\begin{equation}
+    g_i(t) = \sigma\!\left( u_{h_i}(t) - \beta \sum_{j \neq i} u_{h_j}(t) \right),
+\end{equation}
+where \(\beta \approx 0.5\) controls the strength of lateral inhibition and \(\sigma(\cdot)\) represents the nonlinear ensemble transfer function induced by neuronal thresholds and saturation. This lateral inhibition mechanism selectively disinhibits the thalamic channel corresponding to the operator with maximal utility, whilst suppressing competing channels.
+
+The \emph{Thalamus} realises action gating through four independent one-dimensional ensembles, each with \(n_{\text{thal}} = 100\) neurons. These ensembles receive inhibitory projections from the corresponding GPi channels with negative synaptic weights, effectively inverting the inhibitory signal into an excitatory representation. The thalamic output \(\pmb{a}(t) \in \mathbb{R}^4\) approximates a one-hot vector, where the component corresponding to the selected operator approaches unity whilst others decay towards zero. This gating signal is subsequently routed to the Motor Cortex, encoded as a four-dimensional ensemble with \(n_{\text{motor}} = 400\) neurons (100 per action dimension), which decodes the selected operator index and triggers the corresponding population-generation subroutine.
+
+Synaptic time constants throughout the CBTL circuit are chosen to balance responsiveness and stability. State-to-utility projections employ \(\tau_{\text{syn}} = 10\,\text{ms}\) to smooth transient fluctuations in diversity, improvement rate, and convergence features. Basal ganglia internal connections utilise \(\tau_{\text{syn}} = 5\,\text{ms}\) to enable rapid competition dynamics, whilst thalamus-to-motor projections adopt \(\tau_{\text{syn}} = 10\,\text{ms}\) to ensure stable action selection without chattering between operators. This temporal hierarchy ensures that operator selection adapts to sustained changes in search state whilst remaining robust to brief perturbations induced by stochastic evaluations.
+
+The neuromorphic substrate employed in this work leverages the Nengo framework \cite{Bekolay2014nengo}, which compiles NEF models onto both conventional processors (via CPU/GPU simulation) and neuromorphic hardware (Intel Loihi, IBM TrueNorth, SpiNNaker). The complete CBTL circuit comprises approximately \(n_{\text{total}} = n_{\text{state}} + 4 \cdot n_{\text{util}} + 4 \cdot n_{\text{BG}} + 4 \cdot n_{\text{thal}} + n_{\text{motor}} \approx 1{,}500\) neurons and roughly \(4{,}500\) synapses, representing less than \(2\%\) of a single Intel Loihi chip's capacity. This compact footprint enables massively parallel deployment, wherein hundreds of independent optimisation instances can execute concurrently on a single neuromorphic processor, each maintaining isolated CBTL dynamics and memory structures. Event-driven execution on neuromorphic hardware further enhances efficiency, as synaptic operations occur only upon spike arrival rather than at every simulation timestep, yielding energy consumption of approximately \(30\,\text{pJ}\) per synaptic event—orders of magnitude below the \(5{-}20\,\text{nJ}\) per floating-point operation characteristic of conventional architectures \cite{Davies2018loihi}.
+
+\section{Preliminary Experiments}
+% Performance results
+
+\begin{figure}
+    \centering
+    \includegraphics[width=1.0\linewidth]{figures/01_10D_neuroptibg.png}
+    \includegraphics[width=1.0\linewidth]{figures/10_10D_neuroptibg.png}
+    \caption{Caption}
+    \label{fig:placeholder}
+\end{figure}
+
+\subsection{Complexity Analysis}
+
+The computational cost per iteration is primarily governed by candidate evaluation, scaling as
+\(\mathcal{O}(N\cdot C_f)\), where \(C_f\) denotes the cost of the objective function. Operator generation
+contributes \(\mathcal{O}(N\cdot D)\), since each candidate involves a small number of arithmetic operations
+per dimension, while feature extraction and utility adaptation introduce negligible costs of
+\(\mathcal{O}(D)\) and \(\mathcal{O}(H)\), with \(H=4\) search operators.
+
+In the neuromorphic implementation, each variable is represented by a neural ensemble comprising
+\(n_e\) spiking units. The projection and decoding operations across ensembles contribute an additional
+\(\mathcal{O}(n_e)\) cost per feature or control signal, yet this overhead remains bounded owing to
+event-driven processing and synaptic sparsity. Consequently, the total iteration complexity can be expressed as
+\begin{equation}
+    \mathcal{O}(N\cdot C_f + N\cdot D + H + n_e),
+\end{equation}
+which reduces to \(\mathcal{O}(N\cdot C_f)\) when \(C_f \gg D\cdot n_e\). The parallel nature of ensemble evaluation
+and population updates ensures near-constant iteration time under distributed neuromorphic execution,
+preserving scalability across both algorithmic and neural dimensions.
+
+\subsection{Computational Complexity}\label{Sec:Complexity}
+
+Let \(D\) be the dimension, \(N\) the population size per step, \(M\) the memory size, \(H=4\) the number of SOs, and \(C_f\) the cost of a single objective evaluation. The neuromorphic model runs with discrete step \(\Delta t\) over horizon \(T\), with a total neuron budget \(E\) across ensembles and basal-ganglia/thalamic circuits.
+
+\paragraph{Operator generation.}
+Each SO performs \( \mathcal{O}(D) \) arithmetic per candidate. Hence, LF/DM/PS/SP each cost \( \mathcal{O}(N D) \) per step. PS maintains velocities, adding only storage and a constant-time update per coordinate, still \( \mathcal{O}(N D) \).
+
+\paragraph{Evaluation.}
+Objective evaluation dominates with \( \mathcal{O}(N C_f) \) per step. This term is typically the leading cost in black-box settings, i.e. \( C_f \gg D \).
+
+\paragraph{State features.}
+Diversity uses per-dimension standard deviations of the normalised matrix of candidates; a single pass yields \( \mathcal{O}(N D) \). The improvement-rate over a window of length \(W\) is \( \mathcal{O}(W) \) if computed directly, or \( \mathcal{O}(1) \) amortised with an incremental counter. The convergence indicator (range over fitness) costs \( \mathcal{O}(N) \). Overall: \( \mathcal{O}(N D) \) per step, dominated by diversity.
+
+\paragraph{Utility mapping and selection.}
+The utility vector \(\pmb{u}_o(t)=\pmb{W}(\pmb{A}\pmb{s}(t)+\pmb{b})\) is a \(4\times 3\) affine map: \( \mathcal{O}(H) \). Winner–take–all selection over \(H\) channels is \( \mathcal{O}(H) \).
+
+\paragraph{Learning rule.}
+The local reinforcement update (reward computation plus bounded update of the last-used weight) is \( \mathcal{O}(1) \) per step.
+
+\paragraph{Memory update.}
+Competitive replacement scans the current batch against the memory. With a naïve arg\,max over \(M\) for each of the \(N\) candidates, this is \( \mathcal{O}(N M) \) per step; with a running index of the worst slot or a max–heap, this reduces to \( \mathcal{O}(N + \log M) \).
+
+\paragraph{Neuromorphic runtime.}
+Neural ensembles (state, utilities, basal ganglia, thalamus, selection) add an event-driven overhead per simulation tick. Denote by \(E\) the total neuron count and by \(C\) the effective synaptic fan-in used by filtered projections. The per-tick cost is \( \mathcal{O}(E + C) \). Since utility computation is low-dimensional and gating is sparse, this term remains bounded and, in practice, negligible with respect to \( \mathcal{O}(N C_f) \) under typical \(C_f\).
+
+\paragraph{Space complexity.}
+The memory stores \(M\) vectors and their fitness: \( \mathcal{O}(M (D+1)) \). Operator buffers for the current population require \( \mathcal{O}(N D) \). PS adds \( \mathcal{O}(N D) \) velocities. Neural state is \( \mathcal{O}(E + C) \).
+
+\paragraph{Parallelism.}
+Operator generation and evaluations are embarrassingly parallel across the \(N\) candidates. On neuromorphic or SIMD/SIMT back-ends, wall-clock time per step approaches the critical path of evaluation and inter-ensemble communication, while asymptotic work remains as below.
+
+\paragraph{Overall bound.}
+Per step,
+\[
+\mathcal{O}\big(N C_f\big)
+\;+\;
+\mathcal{O}\big(N D\big)
+\;+\;
+\mathcal{O}\big(N M\big)
+\;+\;
+\mathcal{O}\big(E + C\big)
+\;+\;
+\mathcal{O}(H),
+\]
+which in the common regime \(C_f \gg D,\,M,\,E\) reduces to \(\mathcal{O}(N C_f)\). If memory replacement is optimised to \( \mathcal{O}(N + \log M) \), the second dominant term remains \( \mathcal{O}(N D) \).
+
+
+\section{Prospectives}
+
+
+\section{Challenges and Open Questions}
+
+
+\section{Roadmap}
+
+\section{Call to Action}
+
+% ----
+
+\begin{credits}
+\subsubsection{\ackname} This work has been supported by the ERC Generator at the University of Lille.
+
+\subsubsection{\discintname}
+The authors declare no competing interests relevant to the content of this article.
+\end{credits}
+%
+% ---- Bibliography ----
+
+\bibliographystyle{splncs04}
+\bibliography{references}
+
+\end{document}

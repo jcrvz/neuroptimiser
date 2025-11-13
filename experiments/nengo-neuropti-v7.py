@@ -17,10 +17,10 @@ KEY FEATURES
    best operator based on state-dependent utility functions
 
 2. **Multiple Operators**: Currently implements four fundamentally different strategies:
-   - LEVY: Lévy flight exploration (heavy-tailed jumps for escaping local minima)
-   - DE: Differential Evolution (uses memory diversity for directed exploration)
-   - PSO: Particle Swarm Optimization (velocity-based exploitation with attraction)
-   - SPIRAL: Spiral optimization (logarithmic convergence towards best solution)
+   - LF: Lévy flight exploration (heavy-tailed jumps for escaping local minima)
+   - DM: Differential Evolution (uses memory diversity for directed exploration)
+   - PS: Particle Swarm Optimization (velocity-based exploitation with attraction)
+   - SP: Spiral optimization (logarithmic convergence towards best solution)
 
 3. **Population-Based Evaluation**: Each timestep evaluates LAMBDA candidates
    (50× more efficient than single-candidate approaches)
@@ -43,19 +43,19 @@ NEUROMORPHIC COMPONENTS
 
 OPERATOR SELECTION LOGIC
 -------------------------
-LEVY operator selected when:
+LF operator selected when:
   utility = 2.0 * (1 - improvement) + (1 - convergence) - 0.3 * diversity
   → High when stuck (not improving) and not converged (need global escape)
 
-DE operator selected when:
+DM operator selected when:
   utility = 1.5 * diversity + (1 - convergence) + 0.5 * improvement
   → High when memory has diversity and still exploring
 
-PSO operator selected when:
+PS operator selected when:
   utility = 2.0 * improvement + 0.8 * convergence - 0.5 * diversity
   → High when improving and converging (exploitation phase)
 
-SPIRAL operator selected when:
+SP operator selected when:
   utility = 2.0 * convergence + improvement - diversity
   → High when highly converged and still improving (fine-tuning)
 
@@ -98,6 +98,7 @@ import nengo
 import numpy as np
 import math
 from ioh import get_problem
+import seaborn as sns
 
 from neuroptimiser.utils import trs2o
 
@@ -106,9 +107,9 @@ from neuroptimiser.utils import trs2o
 # PROBLEM CONFIGURATION
 # ==============================================================================
 
-PROBLEM_ID = 2
+PROBLEM_ID = 20
 PROBLEM_INS = 1
-NUM_DIMS = 10
+NUM_DIMS = 2
 SIMULATION_TIME = 20.0
 
 problem = get_problem(fid=PROBLEM_ID, instance=PROBLEM_INS, dimension=NUM_DIMS)
@@ -162,13 +163,13 @@ state = {
     "memory_vectors": np.zeros((MU, NUM_DIMS)),
     "memory_fitness": np.full(MU, F_DEFAULT_WORST),
     "memory_age": np.zeros(MU),
-    "current_operator": "LEVY",
-    "operator_counts": {"LEVY": 0, "DE": 0, "PSO": 0, "SPIRAL": 0},
+    "current_operator": "LF",
+    "operator_counts": {"LF": 0, "DM": 0, "PS": 0, "SP": 0},
     "total_evals": 0,
     "improvement_history": [],
     # Adaptive utility weights - learn which operators work best
-    "utility_weights": {"LEVY": 1.0, "DE": 1.0, "PSO": 1.0, "SPIRAL": 1.0},
-    "operator_rewards": {"LEVY": [], "DE": [], "PSO": [], "SPIRAL": []},
+    "utility_weights": {"LF": 1.0, "DM": 1.0, "PS": 1.0, "SP": 1.0},
+    "operator_rewards": {"LF": [], "DM": [], "PS": [], "SP": []},
     "last_operator": None,
     "last_best_f": None,
 }
@@ -193,13 +194,16 @@ class LevyFlight(Operator):
     """EXPLORATION: Heavy-tailed Lévy flight for escaping local minima"""
 
     def __init__(self):
-        super().__init__("LEVY")
+        super().__init__("LF")
         self.alpha = 1.5  # Lévy exponent
 
     def generate_population(self, centre):
         """Generate candidates using Lévy flight"""
         # Mantegna's algorithm for Lévy flight
-        beta = self.alpha
+        global_best = state["best_v"] if state["best_v"] is not None else centre
+
+        _alpha  = 0.3
+        beta    = self.alpha
         sigma_u = (
             math.gamma(1 + beta) * np.sin(np.pi * beta / 2) /
             (math.gamma((1 + beta) / 2) * beta * 2**((beta - 1) / 2))
@@ -207,21 +211,24 @@ class LevyFlight(Operator):
 
         candidates = []
         for _ in range(LAMBDA):
-            u = np.random.normal(0, sigma_u, NUM_DIMS)
-            v = np.random.normal(0, 1, NUM_DIMS)
-            step = u / (np.abs(v) ** (1 / beta))
+            u       = np.random.normal(0, sigma_u, NUM_DIMS)
+            v       = np.random.normal(0, 1, NUM_DIMS)
+            step    = u / (np.abs(v) ** (1 / beta))
+
+            direction = global_best - centre
+
             # Scale step and add to centre
-            candidate = centre + 0.3 * step
+            candidate = centre + _alpha * step + 0.1 * direction
             candidates.append(np.clip(candidate, -1.0, 1.0))
 
         return np.array(candidates)
 
 
 class DifferentialEvolution(Operator):
-    """EXPLORATION: DE/rand/1 mutation using memory diversity"""
+    """EXPLORATION: DM/rand/1 mutation using memory diversity"""
 
     def __init__(self):
-        super().__init__("DE")
+        super().__init__("DM")
         self.F = 0.8  # Mutation factor
 
     def generate_population(self, centre):
@@ -240,7 +247,7 @@ class DifferentialEvolution(Operator):
             idx = np.random.choice(len(valid_vectors), 3, replace=False)
             a, b, c = valid_vectors[idx]
 
-            # DE mutation: a + F * (b - c)
+            # DM mutation: a + F * (b - c)
             mutant = a + self.F * (b - c)
             candidates.append(np.clip(mutant, -1.0, 1.0))
 
@@ -248,10 +255,10 @@ class DifferentialEvolution(Operator):
 
 
 class ParticleSwarm(Operator):
-    """EXPLOITATION: PSO with personal and global best attraction"""
+    """EXPLOITATION: PS with personal and global best attraction"""
 
     def __init__(self):
-        super().__init__("PSO")
+        super().__init__("PS")
         self.w = 0.7  # Inertia weight
         self.c1 = 1.5  # Cognitive coefficient
         self.c2 = 1.5  # Social coefficient
@@ -259,7 +266,7 @@ class ParticleSwarm(Operator):
         self.velocities = {}
 
     def generate_population(self, centre):
-        """Generate candidates using PSO dynamics"""
+        """Generate candidates using PS dynamics"""
         global_best = state["best_v"] if state["best_v"] is not None else centre
 
         candidates = []
@@ -271,7 +278,7 @@ class ParticleSwarm(Operator):
             # Current position (sample around centre with small noise)
             current = centre + np.random.randn(NUM_DIMS) * 0.05
 
-            # PSO velocity update
+            # PS velocity update
             r1, r2 = np.random.rand(2)
             cognitive = self.c1 * r1 * (centre - current)  # Personal best = centre
             social = self.c2 * r2 * (global_best - current)  # Global best
@@ -293,58 +300,69 @@ class ParticleSwarm(Operator):
 
 
 class SpiralOptimization(Operator):
-    """EXPLOITATION: Logarithmic spiral towards best solution"""
+    """EXPLOITATION: Anisotropic Spiral Optimisation with per-plane randomisation"""
 
     def __init__(self):
-        super().__init__("SPIRAL")
-        self.r_max = 1.0  # Maximum radius
-        self.r_min = 0.01  # Minimum radius
+        super().__init__("SP")
+        self.r_base = 0.95  # Base convergence rate
+        self.min_theta = 1e-3
+        self.max_theta = 2 * np.pi
 
     def generate_population(self, centre):
-        """Generate candidates on logarithmic spiral around centre"""
+        """Generate candidates using anisotropic spiral with per-plane randomisation"""
         global_best = state["best_v"] if state["best_v"] is not None else centre
 
         candidates = []
+        n_planes = NUM_DIMS // 2  # Number of 2D planes
+
         for i in range(LAMBDA):
-            # Spiral parameters
-            theta = np.random.uniform(0, 2 * np.pi)  # Angle
-            # Logarithmic decay
-            progress = i / LAMBDA
-            r = self.r_max * np.exp(-5 * progress)  # Decay radius
+            x = centre.copy()
 
-            # Generate point on spiral in each 2D plane
-            candidate = centre.copy()
-            for d in range(0, NUM_DIMS - 1, 2):
-                # Rotate towards global best in this 2D plane
-                direction = global_best[[d, d + 1]] - centre[[d, d + 1]]
-                if np.linalg.norm(direction) > 1e-8:
-                    direction = direction / np.linalg.norm(direction)
-                else:
-                    direction = np.array([1.0, 0.0])
+            # INDEPENDENT rotation and convergence for each 2D plane
+            for plane_idx in range(n_planes):
+                d = plane_idx * 2  # Dimensional indices for this plane
 
-                # Spiral point
-                x = r * np.cos(theta)
-                y = r * np.sin(theta)
+                # Per-plane random rotation angle
+                theta_plane = np.random.uniform(self.min_theta, self.max_theta)
 
-                # Rotate to align with direction
-                rotated = np.array([
-                    x * direction[0] - y * direction[1],
-                    x * direction[1] + y * direction[0]
+                # Per-plane random convergence rate
+                r_variation_plane = np.random.uniform(0.9, 1.1)
+                r_plane = np.clip(self.r_base * r_variation_plane, 0.85, 0.999)
+
+                # Extract 2D slice for this plane
+                x_d = x[d:d+2] - global_best[d:d+2]
+
+                # Spiral transformation with plane-specific parameters
+                r_theta = r_plane ** theta_plane
+
+                cos_t = np.cos(theta_plane)
+                sin_t = np.sin(theta_plane)
+
+                x_rotated = r_theta * np.array([
+                    cos_t * x_d[0] - sin_t * x_d[1],
+                    sin_t * x_d[0] + cos_t * x_d[1]
                 ])
 
-                candidate[[d, d + 1]] = centre[[d, d + 1]] + rotated
+                x[d:d+2] = global_best[d:d+2] + x_rotated
 
-            candidates.append(np.clip(candidate, -1.0, 1.0))
+            # Handle odd dimension independently
+            if NUM_DIMS % 2 == 1:
+                theta_odd = np.random.uniform(self.min_theta, self.max_theta)
+                r_odd = np.clip(self.r_base * np.random.uniform(0.9, 1.1), 0.85, 0.999)
+                x[-1] = global_best[-1] + r_odd ** theta_odd * (x[-1] - global_best[-1])
+
+            candidates.append(np.clip(x, -1.0, 1.0))
 
         return np.array(candidates)
 
 
+
 # Instantiate operators
 OPERATORS = {
-    "LEVY": LevyFlight(),
-    "DE": DifferentialEvolution(),
-    "PSO": ParticleSwarm(),
-    "SPIRAL": SpiralOptimization(),
+    "LF": LevyFlight(),
+    "DM": DifferentialEvolution(),
+    "PS": ParticleSwarm(),
+    "SP": SpiralOptimization(),
 }
 
 # ==============================================================================
@@ -483,36 +501,36 @@ with model:
     # Input: [diversity, improvement_rate, convergence]
 
     def utility_levy(x):
-        """LEVY: Use when stuck (low improvement) and not converged (need global exploration)"""
+        """LF: Use when stuck (low improvement) and not converged (need global exploration)"""
         diversity, improvement, convergence = x
         # Reduced base utility - only use when really stuck
         base = (1.0 - improvement) * 0.5 + (1.0 - convergence) * 0.3
         # Modulate by learned weight
-        return base * state["utility_weights"]["LEVY"]
+        return base * state["utility_weights"]["LF"]
 
     def utility_de(x):
-        """DE: Use when have diversity in memory and exploring"""
+        """DM: Use when have diversity in memory and exploring"""
         diversity, improvement, convergence = x
         # Favor when diversity exists
         base = diversity * 0.8 + (1.0 - convergence) * 0.3 + 0.2  # Added small bias
         # Modulate by learned weight
-        return base * state["utility_weights"]["DE"]
+        return base * state["utility_weights"]["DM"]
 
     def utility_pso(x):
-        """PSO: Use when improving and starting to converge (exploitation phase)"""
+        """PS: Use when improving and starting to converge (exploitation phase)"""
         diversity, improvement, convergence = x
         # Favor improvement and convergence
         base = improvement * 0.8 + convergence * 0.4 + 0.2  # Added small bias
         # Modulate by learned weight
-        return base * state["utility_weights"]["PSO"]
+        return base * state["utility_weights"]["PS"]
 
     def utility_spiral(x):
-        """SPIRAL: Use when highly converged and still improving (fine-tuning)"""
+        """SP: Use when highly converged and still improving (fine-tuning)"""
         diversity, improvement, convergence = x
         # Favor when very converged
         base = convergence * 0.8 + improvement * 0.4 + 0.1  # Small bias for fine-tuning
         # Modulate by learned weight
-        return base * state["utility_weights"]["SPIRAL"]
+        return base * state["utility_weights"]["SP"]
 
     # Number of operators
     n_operators = 4
@@ -522,28 +540,28 @@ with model:
         n_neurons=NEURONS_BG,
         dimensions=1,
         radius=3.0,
-        label="Utility LEVY"
+        label="Utility LF"
     )
 
     utility_de_ens = nengo.Ensemble(
         n_neurons=NEURONS_BG,
         dimensions=1,
         radius=3.0,
-        label="Utility DE"
+        label="Utility DM"
     )
 
     utility_pso_ens = nengo.Ensemble(
         n_neurons=NEURONS_BG,
         dimensions=1,
         radius=3.0,
-        label="Utility PSO"
+        label="Utility PS"
     )
 
     utility_spiral_ens = nengo.Ensemble(
         n_neurons=NEURONS_BG,
         dimensions=1,
         radius=3.0,
-        label="Utility SPIRAL"
+        label="Utility SP"
     )
 
     # Connect state to utilities
@@ -604,7 +622,7 @@ with model:
                 # Improvement! Give positive reward
                 reward = (state["last_best_f"] - state["best_f"]) / (abs(state["last_best_f"]) + EPS)
                 # Increase weight for successful operator
-                learning_rate = 0.1
+                learning_rate = 0.4
                 state["utility_weights"][state["last_operator"]] += learning_rate * reward
                 # Keep weights in reasonable range
                 state["utility_weights"][state["last_operator"]] = np.clip(
@@ -729,8 +747,54 @@ if state["best_v"] is not None:
 # ==============================================================================
 # VISUALIZATION
 # ==============================================================================
+fontsize = 14
+plt.rcParams.update({
+    # LaTeX rendering
+    'text.usetex': True,
+    # 'text.latex.preamble': r'\usepackage{amsmath}',
 
-fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    # Fonts
+    'font.family': 'serif',
+    'font.serif': ['Computer Modern Roman'],
+    'font.size': fontsize,
+    'axes.labelsize': fontsize,
+    'axes.titlesize': fontsize,
+    'xtick.labelsize': fontsize,
+    'ytick.labelsize': fontsize,
+    'legend.fontsize': fontsize,
+
+    # Figure
+    'figure.dpi': 300,
+    'figure.figsize': (14, 8),
+    'savefig.dpi': 300,
+    'savefig.bbox': 'tight',
+    'savefig.pad_inches': 0.05,
+
+    # Lines and markers
+    'lines.linewidth': 1.5,
+    'lines.markersize': 4,
+    'axes.linewidth': 0.8,
+
+    # Grid
+    'grid.linewidth': 0.5,
+    'grid.alpha': 0.3,
+    'grid.color': '0.9',
+    'axes.grid': True,
+
+    # Legend
+    'legend.frameon': True,
+    'legend.framealpha': 0.9,
+    'legend.edgecolor': '0.8',
+
+    # Ticks
+    'xtick.direction': 'in',
+    'ytick.direction': 'in',
+    'xtick.major.width': 0.8,
+    'ytick.major.width': 0.8,
+})
+
+
+fig, axes = plt.subplots(3, 1, figsize=(7, 7), sharex=True)
 
 # Extract data
 stats_data = sim.data[stats_probe]
@@ -747,27 +811,55 @@ mean_valid = mean_f_trace[valid_mask]
 
 ax1.plot(t_valid, best_valid - problem.optimum.y, 'b-', linewidth=2, label='Best-so-far error')
 ax1.plot(t_valid, mean_valid - problem.optimum.y, 'gray', alpha=0.3, linewidth=0.5, label='Population mean error')
-ax1.set_ylabel('Fitness Error', fontsize=12)
+ax1.set_ylabel('Fitness Error')
 ax1.set_yscale('log')
 ax1.legend(loc='upper right')
 ax1.grid(True, alpha=0.3)
 
 # Plot 2: Operator selection
+# ax2 = axes[1]
+# operator_names = list(OPERATORS.keys())
+# colors = {'LF': 'red', 'DM': 'orange', 'PS': 'green', 'SP': 'blue'}
+#
+# for i, op_name in enumerate(operator_names):
+#     mask = operator_trace == i
+#     if np.any(mask):
+#         ax2.scatter(sim.trange()[mask], np.ones(np.sum(mask)) * i,
+#                     c=colors.get(op_name, 'gray'), s=1, alpha=0.5, label=op_name)
+#
+# ax2.set_ylabel('Active Operator')
+# ax2.set_yticks(range(len(operator_names)))
+# ax2.set_yticklabels(operator_names)
+# ax2.legend(loc='upper right')
+# ax2.grid(True, alpha=0.3)
+
+# Plot 2: Operator selection with horizontal violin plots
 ax2 = axes[1]
 operator_names = list(OPERATORS.keys())
-colors = {'LEVY': 'red', 'DE': 'orange', 'PSO': 'green', 'SPIRAL': 'blue'}
+colors = {'LF': 'red', 'DM': 'orange', 'PS': 'green', 'SP': 'blue'}
 
+# Histogram-style visualization
 for i, op_name in enumerate(operator_names):
     mask = operator_trace == i
-    if np.any(mask):
-        ax2.scatter(sim.trange()[mask], np.ones(np.sum(mask)) * i,
-                    c=colors.get(op_name, 'gray'), s=1, alpha=0.5, label=op_name)
+    times = sim.trange()[mask]
 
-ax2.set_ylabel('Active Operator', fontsize=12)
+    if len(times) > 0:
+        # Plot vertical lines at each activation
+        ax2.vlines(times, i - 0.3, i + 0.3,
+                   colors=colors[op_name], alpha=0.3, linewidths=0.5)
+        # Add density line
+        hist, edges = np.histogram(times, bins=50)
+        centers = (edges[:-1] + edges[1:]) / 2
+        density = hist / hist.max() * 0.4  # Normalize to ±0.4 height
+        ax2.fill_between(centers, i - density, i + density,
+                         color=colors[op_name], alpha=0.5, label=op_name)
+
+ax2.set_ylabel('Active Operator')
 ax2.set_yticks(range(len(operator_names)))
 ax2.set_yticklabels(operator_names)
-ax2.legend(loc='upper right')
-ax2.grid(True, alpha=0.3)
+# ax2.legend(loc='upper right')
+ax2.grid(True, alpha=0.3, axis='x')
+ax2.set_ylim(-0.5, len(operator_names) - 0.5)
 
 # Plot 3: State features (use RAW features from node, not filtered ensemble)
 ax3 = axes[2]
@@ -783,9 +875,9 @@ improvement_raw = raw_features[::downsample, 1]
 convergence_raw = raw_features[::downsample, 2]
 
 # Plot raw features (solid lines)
-ax3.plot(time_ds, diversity_raw, 'r-', label='Diversity (raw)', alpha=0.8, linewidth=1.5)
-ax3.plot(time_ds, improvement_raw, 'g-', label='Improvement Rate (raw)', alpha=0.8, linewidth=1.5)
-ax3.plot(time_ds, convergence_raw, 'b-', label='Convergence (raw)', alpha=0.8, linewidth=1.5)
+ax3.plot(time_ds, diversity_raw, 'r-', label=r'Diversity ($\phi_s$)', alpha=0.8, linewidth=1.5)
+ax3.plot(time_ds, improvement_raw, 'g-', label=r'Improvement Rate ($\phi_i$)', alpha=0.8, linewidth=1.5)
+ax3.plot(time_ds, convergence_raw, 'b-', label=r'Convergence ($\phi_c$)', alpha=0.8, linewidth=1.5)
 
 # Optionally plot neural filtered versions (dashed, for comparison)
 diversity_neural = neural_features[::downsample, 0]
@@ -796,19 +888,24 @@ ax3.plot(time_ds, diversity_neural, 'r--', alpha=0.3, linewidth=1.0, label='_div
 ax3.plot(time_ds, improvement_neural, 'g--', alpha=0.3, linewidth=1.0, label='_improvement_neural')
 ax3.plot(time_ds, convergence_neural, 'b--', alpha=0.3, linewidth=1.0, label='_convergence_neural')
 
-ax3.set_xlabel('Time (s)', fontsize=12)
-ax3.set_ylabel('Feature Value', fontsize=12)
+ax3.set_xlabel('Time (s)')
+ax3.set_ylabel('Feature Value')
 ax3.set_ylim(-0.1, 1.1)
-ax3.legend(loc='upper right')
-ax3.grid(True, alpha=0.3)
+ax3.legend(loc='center right')
+# ax3.grid(True, alpha=0.3)
 
-plt.suptitle(f'{problem.meta_data.name} (D={NUM_DIMS}) | '
-             f'Evals: {total_evals:,} | '
-             f'Best: {state["best_f"]:.2f} | '
-             f'Error: {state["best_f"] - problem.optimum.y:.2e}',
-             fontsize=14, fontweight='bold')
+plt.suptitle(f'{problem.meta_data.name} (f{problem.meta_data.problem_id:02d}) {NUM_DIMS}D; '
+             # f'Evals: {total_evals:,}; '
+             f'Best: {state["best_f"]:.2f}; '
+             f'Error: {state["best_f"] - problem.optimum.y:.2g}')
 
 plt.tight_layout()
+
+FOLDER = "./simple_plots/"
+
+plt.savefig(FOLDER +
+    f'{problem.meta_data.problem_id:02d}_{NUM_DIMS}D_neuroptibg.png')
+
 plt.show()
 
 # %%
