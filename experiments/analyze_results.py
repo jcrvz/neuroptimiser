@@ -86,6 +86,73 @@ def create_dataframe(results):
 # ANALYSIS
 # ==============================================================================
 
+def create_function_dimension_statistics(df):
+    """
+    Create detailed statistics DataFrame for each function-dimension combination.
+
+    Returns a DataFrame with rows for each (function_id, dimension) pair and
+    columns for various statistics on best_fitness and error.
+    """
+
+    if df is None or len(df) == 0:
+        return None
+
+    stats_rows = []
+
+    # Iterate over all combinations of function_id and dimension
+    for fid in sorted(df['function_id'].unique()):
+        for dim in sorted(df['dimension'].unique()):
+            # Filter data for this combination
+            df_subset = df[(df['function_id'] == fid) & (df['dimension'] == dim)]
+
+            if len(df_subset) == 0:
+                continue
+
+            # Calculate statistics
+            stats = {
+                'function_id': fid,
+                'dimension': dim,
+                'n_instances': len(df_subset),
+
+                # Best fitness statistics
+                'best_fitness_mean': df_subset['best_fitness'].mean(),
+                'best_fitness_median': df_subset['best_fitness'].median(),
+                'best_fitness_std': df_subset['best_fitness'].std(),
+                'best_fitness_min': df_subset['best_fitness'].min(),
+                'best_fitness_max': df_subset['best_fitness'].max(),
+                'best_fitness_q25': df_subset['best_fitness'].quantile(0.25),
+                'best_fitness_q75': df_subset['best_fitness'].quantile(0.75),
+
+                # Error statistics (absolute)
+                'error_mean': df_subset['abs_error'].mean(),
+                'error_median': df_subset['abs_error'].median(),
+                'error_std': df_subset['abs_error'].std(),
+                'error_min': df_subset['abs_error'].min(),
+                'error_max': df_subset['abs_error'].max(),
+                'error_q25': df_subset['abs_error'].quantile(0.25),
+                'error_q75': df_subset['abs_error'].quantile(0.75),
+
+                # Log error statistics
+                'log_error_mean': df_subset['log_error'].mean(),
+                'log_error_median': df_subset['log_error'].median(),
+                'log_error_std': df_subset['log_error'].std(),
+
+                # Success metrics
+                'success_rate_1e-4': (df_subset['abs_error'] < 1e-4).sum() / len(df_subset) * 100,
+                'success_rate_1e-6': (df_subset['abs_error'] < 1e-6).sum() / len(df_subset) * 100,
+                'success_rate_1e-8': (df_subset['abs_error'] < 1e-8).sum() / len(df_subset) * 100,
+
+                # Optimal fitness (should be constant for all instances)
+                'optimal_fitness': df_subset['optimal_fitness'].iloc[0],
+            }
+
+            stats_rows.append(stats)
+
+    # Create DataFrame
+    stats_df = pd.DataFrame(stats_rows)
+
+    return stats_df
+
 def print_summary(df):
     """Print summary statistics"""
 
@@ -150,6 +217,7 @@ def plot_results(df, output_dir):
         use_latex = False
 
     # Publication-quality style settings
+    fontsize = 14
     plt.rcParams.update({
         # LaTeX rendering (conditional)
         'text.usetex': use_latex,
@@ -157,12 +225,12 @@ def plot_results(df, output_dir):
         # Fonts
         'font.family': 'serif',
         'font.serif': ['Computer Modern Roman'] if use_latex else ['DejaVu Serif'],
-        'font.size': 11,
-        'axes.labelsize': 12,
-        'axes.titlesize': 13,
-        'xtick.labelsize': 10,
-        'ytick.labelsize': 10,
-        'legend.fontsize': 10,
+        'font.size': fontsize,
+        'axes.labelsize': fontsize,
+        'axes.titlesize': fontsize,
+        'xtick.labelsize': fontsize,
+        'ytick.labelsize': fontsize,
+        'legend.fontsize': fontsize,
 
         # Figure appearance
         'figure.facecolor': 'white',
@@ -182,7 +250,7 @@ def plot_results(df, output_dir):
         'grid.linewidth': 0.5,
         'grid.alpha': 0.3,
         'grid.color': '0.7',
-        'axes.grid': True,
+        'axes.grid': False,
         'axes.axisbelow': True,
 
         # Legend
@@ -239,7 +307,7 @@ def plot_results(df, output_dir):
             parts[partname].set_linewidth(1.2)
 
     ax.set_xticks(positions)
-    ax.set_xticklabels([f'$D={d}$' for d in dims])
+    ax.set_xticklabels([f'${d}$D' for d in dims])
     ax.set_xlabel('Problem Dimension')
     ax.set_ylabel(r'$\log_{10}(\mathrm{Error})$')
     ax.grid(True, axis='y', alpha=0.3)
@@ -271,20 +339,108 @@ def plot_results(df, output_dir):
 
         offset = width * (idx - 0.5)
         bars = ax.bar(x + offset, means, width, yerr=stds,
-                     label=f'$D={dim}$', alpha=0.8, capsize=3,
-                     color=['#56B4E9', '#E69F00'][idx])
+                     label=f'${dim}$D', alpha=0.8, capsize=3,
+                     color=['#56B4E9', '#84E690', '#E69F00'][idx])
 
     ax.set_xlabel('Function ID')
     ax.set_ylabel(r'Mean $\log_{10}(\mathrm{Error})$')
     ax.set_xticks(x)
     ax.set_xticklabels([f'{fid}' for fid in function_ids])
-    ax.legend(loc='upper left', ncol=2)
+    ax.legend(loc='upper left', ncol=3)
     ax.grid(True, axis='y', alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(output_dir / 'error_by_function.pdf', dpi=300, transparent=True)
     plt.savefig(output_dir / 'error_by_function.png', dpi=300, transparent=False)
     print(f"Saved: {output_dir / 'error_by_function.pdf'}")
+    plt.close()
+
+    # 2. Error by function (violin plots grouped by dimension)
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    function_ids = sorted(df['function_id'].unique())
+    dims = sorted(df['dimension'].unique())
+
+    # Calculate positions for grouped violins
+    n_dims = len(dims)
+    width = 0.8 / n_dims
+    positions_base = np.arange(len(function_ids))
+
+    # Color palette for dimensions
+    dim_colors = ['#56B4E9', '#84E690', '#E69F00'][:n_dims]
+
+    for dim_idx, dim in enumerate(dims):
+        df_dim = df[df['dimension'] == dim]
+
+        # Prepare data for each function
+        violin_data = []
+        positions = []
+
+        for func_idx, fid in enumerate(function_ids):
+            df_func = df_dim[df_dim['function_id'] == fid]
+            if len(df_func) > 0:
+                violin_data.append(df_func['log_error'].values)
+                positions.append(positions_base[func_idx] + width * (dim_idx - n_dims / 2 + 0.5))
+
+        # Create violin plot
+        parts = ax.violinplot(
+            violin_data,
+            positions=positions,
+            widths=width * 0.9,
+            showmeans=True,
+            showextrema=True,
+            showmedians=True
+        )
+
+        # Customize violins
+        for pc in parts['bodies']:
+            pc.set_facecolor(dim_colors[dim_idx])
+            pc.set_alpha(0.7)
+            pc.set_edgecolor('black')
+            pc.set_linewidth(0.8)
+
+        if 'cmedians' in parts:
+            parts['cmedians'].set_edgecolor('red')
+            parts['cmedians'].set_linewidth(1.2)
+
+        if 'cmaxs' in parts:
+            parts['cmaxs'].set_edgecolor('black')
+            parts['cmaxs'].set_linewidth(1.2)
+
+        if 'cmins' in parts:
+            parts['cmins'].set_edgecolor('black')
+            parts['cmins'].set_linewidth(1.2)
+
+        if 'cmeans' in parts:
+            parts['cmeans'].set_edgecolor('blue')
+            parts['cmeans'].set_linewidth(1.2)
+
+        if 'cbars' in parts:
+            parts['cbars'].set_edgecolor('black')
+            parts['cbars'].set_linewidth(1.2)
+
+        # Add to legend (use first violin as proxy)
+        if violin_data:
+            ax.plot([], [], color=dim_colors[dim_idx], linewidth=8,
+                    alpha=0.7, label=f'${dim}$D')
+
+        # Add quartile markers
+        for i, fid in enumerate(function_ids):
+            data = df[df['function_id'] == fid]['log_error'].values
+            q1, q3 = np.percentile(data, [25, 75])
+            ax.plot([i, i], [q1, q3], color='black', linewidth=2, alpha=0.8)
+
+    ax.set_xlabel('Function ID')
+    ax.set_ylabel(r'$\log_{10}(\mathrm{Error})$')
+    ax.set_xticks(positions_base)
+    ax.set_xticklabels([f'{fid}' for fid in function_ids])
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.1), ncol=n_dims, frameon=False)
+    ax.grid(True, axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'error_by_function_v.pdf', dpi=300, transparent=True)
+    plt.savefig(output_dir / 'error_by_function_v.png', dpi=300, transparent=False)
+    print(f"Saved: {output_dir / 'error_by_function_v.pdf'}")
     plt.close()
 
     # 3. Operator usage by dimension (stacked bar with pattern)
@@ -313,7 +469,7 @@ def plot_results(df, output_dir):
     ax.set_ylabel('Operator Usage (\%)')
     ax.set_xlabel('Problem Dimension')
     ax.set_xticks(x)
-    ax.set_xticklabels([f'$D={d}$' for d in dims])
+    ax.set_xticklabels([f'${d}$D' for d in dims])
     ax.set_ylim(0, 100)
     ax.legend(loc='upper right', ncol=2, title='Operator')
     ax.grid(True, axis='y', alpha=0.3)
@@ -429,7 +585,7 @@ def plot_results(df, output_dir):
     # Set ticks and labels
     ax.set_xticks(np.arange(len(pivot_data.columns)))
     ax.set_yticks(np.arange(len(pivot_data.index)))
-    ax.set_xticklabels([f'${d}D$' for d in pivot_data.columns])
+    ax.set_xticklabels([f'${d}$D' for d in pivot_data.columns])
     ax.set_yticklabels([f'{fid}' for fid in pivot_data.index])
 
     ax.set_xlabel('Problem Dimension')
@@ -444,7 +600,7 @@ def plot_results(df, output_dir):
         for j in range(len(pivot_data.columns)):
             value = pivot_data.values[i, j]
             text = ax.text(j, i, f'{value:.1f}',
-                          ha='center', va='center', color='black', fontsize=9)
+                          ha='center', va='center', color='black', fontsize=fontsize)
 
     plt.tight_layout()
     plt.savefig(output_dir / 'performance_heatmap.pdf', dpi=300, transparent=True)
@@ -484,6 +640,36 @@ def main():
 
     # Print summary
     print_summary(df)
+
+    # Create detailed statistics per function-dimension combination
+    print("\n" + "="*70)
+    print("CREATING FUNCTION-DIMENSION STATISTICS")
+    print("="*70)
+
+    stats_df = create_function_dimension_statistics(df)
+
+    if stats_df is not None and len(stats_df) > 0:
+        print(f"\nCreated statistics for {len(stats_df)} function-dimension combinations")
+
+        # Display summary of statistics DataFrame
+        print("\nStatistics DataFrame columns:")
+        print(f"  - Identifiers: function_id, dimension, n_instances")
+        print(f"  - Best fitness stats: mean, median, std, min, max, q25, q75")
+        print(f"  - Error stats: mean, median, std, min, max, q25, q75")
+        print(f"  - Log error stats: mean, median, std")
+        print(f"  - Success rates: at 1e-4, 1e-6, 1e-8 thresholds")
+
+        # Save statistics DataFrame
+        stats_csv_file = RESULTS_DIR / "function_dimension_statistics.csv"
+        stats_df.to_csv(stats_csv_file, index=False)
+        print(f"\n✅ Saved function-dimension statistics to: {stats_csv_file}")
+
+        # Print sample of the statistics (first few rows)
+        print("\nSample of function-dimension statistics:")
+        print(stats_df[['function_id', 'dimension', 'n_instances',
+                        'error_mean', 'error_median', 'success_rate_1e-4']].head(10).to_string(index=False))
+    else:
+        print("⚠️  No statistics to compute")
 
     # Generate plots
     print("\n" + "="*70)

@@ -107,7 +107,7 @@ from neuroptimiser.utils import trs2o
 # PROBLEM CONFIGURATION
 # ==============================================================================
 
-PROBLEM_ID = 20  # 1, 10, 15, 20
+PROBLEM_ID = 1  # 1, 10, 15, 20
 PROBLEM_INS = 1
 NUM_DIMS = 10
 SIMULATION_TIME = 20.0
@@ -139,39 +139,39 @@ def eval_obj_func(v):
 # OPTIMIZER CONFIGURATION
 # ==============================================================================
 
-LAMBDA = 50  # Population size per operator per timestep
-MU = 25  # Memory size
+LAMBDA          = 50  # Population size per operator per timestep
+MU              = 25  # Memory size
 
 # Neuron configuration
 NEURONS_PER_DIM = 100
-NEURONS_BG = 100  # Neurons per action in basal ganglia
+NEURONS_BG      = 100  # Neurons per action in basal ganglia
 
 # Operator parameters
-SIGMA_GLOBAL = 0.5  # Large steps for global exploration
-SIGMA_LOCAL = 0.05  # Small steps for local refinement
-SIGMA_ADAPTIVE = None  # Will be computed from memory variance
+SIGMA_GLOBAL    = 0.5  # Large steps for global exploration
+SIGMA_LOCAL     = 0.05  # Small steps for local refinement
+SIGMA_ADAPTIVE  = None  # Will be computed from memory variance
 
-INIT_TIME = 0.001
+INIT_TIME       = 0.001
 
 # ==============================================================================
 # GLOBAL STATE
 # ==============================================================================
 
 state = {
-    "best_v": None,
-    "best_f": None,
-    "memory_vectors": np.zeros((MU, NUM_DIMS)),
-    "memory_fitness": np.full(MU, F_DEFAULT_WORST),
-    "memory_age": np.zeros(MU),
+    "best_v":           None,
+    "best_f":           None,
+    "memory_vectors":   np.zeros((MU, NUM_DIMS)),
+    "memory_fitness":   np.full(MU, F_DEFAULT_WORST),
+    "memory_age":       np.zeros(MU),
     "current_operator": "LF",
-    "operator_counts": {"LF": 0, "DM": 0, "PS": 0, "SP": 0},
-    "total_evals": 0,
+    "operator_counts":  {"LF": 0, "DM": 0, "PS": 0, "SP": 0},
+    "total_evals":      0,
     "improvement_history": [],
     # Adaptive utility weights - learn which operators work best
-    "utility_weights": {"LF": 1.0, "DM": 1.0, "PS": 1.0, "SP": 1.0},
+    "utility_weights":  {"LF": 1.0, "DM": 1.0, "PS": 1.0, "SP": 1.0},
     "operator_rewards": {"LF": [], "DM": [], "PS": [], "SP": []},
-    "last_operator": None,
-    "last_best_f": None,
+    "last_operator":    None,
+    "last_best_f":  None,
 }
 
 # ==============================================================================
@@ -205,9 +205,9 @@ class LevyFlight(Operator):
         _alpha  = 0.3
         beta    = self.alpha
         sigma_u = (
-            math.gamma(1 + beta) * np.sin(np.pi * beta / 2) /
-            (math.gamma((1 + beta) / 2) * beta * 2**((beta - 1) / 2))
-        ) ** (1 / beta)
+                          math.gamma(1 + beta) * np.sin(np.pi * beta / 2) /
+                          (math.gamma((1 + beta) / 2) * beta * 2**((beta - 1) / 2))
+                  ) ** (1 / beta)
 
         candidates = []
         for _ in range(LAMBDA):
@@ -284,9 +284,9 @@ class ParticleSwarm(Operator):
             social = self.c2 * r2 * (global_best - current)  # Global best
 
             self.velocities[i] = (
-                self.w * self.velocities[i] +
-                cognitive +
-                social
+                    self.w * self.velocities[i] +
+                    cognitive +
+                    social
             )
 
             # Clip velocity
@@ -875,7 +875,7 @@ improvement_raw = raw_features[::downsample, 1]
 convergence_raw = raw_features[::downsample, 2]
 
 # Plot raw features (solid lines)
-ax3.plot(time_ds, diversity_raw, 'r-', label=r'Diversity ($\phi_s$)', alpha=0.8, linewidth=1.5)
+ax3.plot(time_ds, diversity_raw, 'r-', label=r'Diversity ($\phi_d$)', alpha=0.8, linewidth=1.5)
 ax3.plot(time_ds, improvement_raw, 'g-', label=r'Improvement Rate ($\phi_i$)', alpha=0.8, linewidth=1.5)
 ax3.plot(time_ds, convergence_raw, 'b-', label=r'Convergence ($\phi_c$)', alpha=0.8, linewidth=1.5)
 
@@ -897,14 +897,14 @@ ax3.legend(loc='center right')
 plt.suptitle(f'{problem.meta_data.name} (f{problem.meta_data.problem_id:02d}) {NUM_DIMS}D; '
              # f'Evals: {total_evals:,}; '
              f'Best: {state["best_f"]:.2f}; '
-             f'Error: {state["best_f"] - problem.optimum.y:.2g}')
+             f'Error: {state["best_f"] - problem.optimum.y:.3g}')
 
 plt.tight_layout()
 
 FOLDER = "./simple_plots/"
 
 plt.savefig(FOLDER +
-    f'{problem.meta_data.problem_id:02d}_{NUM_DIMS}D_neuroptibg.png')
+            f'{problem.meta_data.problem_id:02d}_{NUM_DIMS}D_neuroptibg.png')
 
 plt.show()
 

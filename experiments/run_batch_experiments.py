@@ -29,7 +29,7 @@ import threading
 
 FUNCTION_IDS = [1, 2, 8, 10, 15, 17, 20, 21, 24]
 INSTANCES = list(range(1, 16))  # 1 to 15
-DIMENSIONS = [2, 10]
+DIMENSIONS = [2, 5, 10]
 
 # Parallel execution settings
 MAX_WORKERS = min(cpu_count() - 1, 8)  # Leave 1 CPU free, max 8 workers
